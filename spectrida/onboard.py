@@ -1,11 +1,10 @@
-"""First-run setup — a text flow (rich console, no TUI). Auto-detects IDA, can pull
-the model. Has jokes. Skippable forever."""
+"""First-run setup — a text flow (rich console, no TUI). Auto-detects IDA and
+checks llama.cpp server. Has jokes. Skippable forever."""
 from __future__ import annotations
 
 import asyncio
 import glob
 import os
-import subprocess
 from pathlib import Path
 
 from rich.console import Console
@@ -72,39 +71,31 @@ def run_onboarding(force: bool = False) -> None:
                     "[dim](demo works without it.)[/]")
 
     # write the config now — preserve existing model if user already configured one
-    existing_model = config.ollama_model()
+    existing_model = config.llamacpp_model()
     model_to_write = existing_model if existing_model and existing_model != "spectrida-re" else "spectrida-re"
     config.write_config(idalib=ida or "", model=model_to_write)
 
-    # ── Ollama + model ──
-    async def _ollama_state():
-        if not services.ollama_installed():
+    # ── llama.cpp server + model ──
+    async def _llamacpp_state():
+        if not services.llamacpp_installed():
             return "missing", False
-        running = await services.ollama_running() or await services.ensure_ollama()
+        running = await services.llamacpp_running() or await services.ensure_llamacpp()
         if not running:
             return "stopped", False
         return "running", await services.model_present()
 
-    state, has_model = asyncio.run(_ollama_state())
+    state, has_model = asyncio.run(_llamacpp_state())
     if state == "missing":
-        c.print(f"  [yellow]•[/]  Ollama — not installed:  [b]{services.ollama_install_hint()}[/]")
+        c.print(f"  [yellow]•[/]  llama.cpp — not reachable:  [b]{services.llamacpp_install_hint()}[/]")
     elif state == "stopped":
-        c.print("  [yellow]•[/]  Ollama — couldn't start it. Run [b]ollama serve[/] yourself.")
+        c.print("  [yellow]•[/]  llama.cpp — server not reachable. Start [b]llama-server[/] yourself.")
+        c.print(f"       [dim]example model source: {_MODEL}[/]")
     else:
-        c.print("  [green]✓[/]  Ollama — up and awake.")
+        c.print("  [green]✓[/]  llama.cpp server — up and awake.")
         if has_model:
-            c.print("  [green]✓[/]  the model — pulled and ready. you absolute professional.")
+            c.print("  [green]✓[/]  the model — loaded and ready. you absolute professional.")
         else:
-            c.print(f"  [yellow]•[/]  the model — not pulled. ([dim]8.7 GB[/])")
-            try:
-                ans = input("       pull it now? [y/N] ").strip().lower()
-            except EOFError:
-                ans = "n"
-            if ans == "y":
-                c.print(f"  [cyan]pulling {_MODEL} — go get that coffee…[/]")
-                subprocess.run(["ollama", "pull", _MODEL])
-            else:
-                c.print(f"       [dim]later, then:  ollama pull {_MODEL}[/]")
+            c.print("  [yellow]•[/]  the model — /v1/models did not report it.")
 
     config.set_onboarded()
     c.print()

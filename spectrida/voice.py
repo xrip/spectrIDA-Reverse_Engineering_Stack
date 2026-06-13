@@ -122,14 +122,14 @@ _BUCKETS: dict[str, list[tuple[str, dict[str, list[str]]]]] = {
                 "Something spooked.", "Ran into a wall.", "Error, the noun.",
             ],
             "cause": [
-                "Probably a path.", "idalib's being shy.", "Ollama's asleep.",
+                "Probably a path.", "idalib's being shy.", "llama.cpp's asleep.",
                 "The .i64 sidecars are fighting again.", "A config's off.",
                 "The model wandered off.", "Could be me. Could be IDA.",
                 "Honestly unclear.",
             ],
             "fix": [
                 "Check the config?", "Try `spectrida onboard`.",
-                "Is Ollama running?", "Point me at the right idalib.",
+                "Is llama-server running?", "Point me at the right idalib.",
                 "Re-run it, sometimes ghosts flake.", "See the log above.",
                 "Nothing's on fire, though.",
             ],

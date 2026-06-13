@@ -1,4 +1,4 @@
-"""Canned data so the TUI runs with no IDA and no Ollama (for --demo + the tutorial)."""
+"""Canned data so the TUI runs with no IDA and no llama.cpp server."""
 from __future__ import annotations
 
 import asyncio
@@ -120,14 +120,23 @@ def get_protos(addresses: list) -> dict:
     return out
 
 
-# naming hints per function (strings / constants / api calls) for the demo
+# naming hints per function for the demo
 _DEMO_META = {
-    0x1400013A0: {"strings": [], "constants": ["0x0"], "api_calls": []},
+    0x1400013A0: {"strings": [], "constants": ["0x0"], "api_calls": [],
+                  "function_facts": {"size": 96, "instruction_count": 24,
+                                     "leaf": False, "calls_out": 1, "callers": 1},
+                  "field_accesses": ["[rcx+40h] in movss xmm0, dword ptr [rcx+40h]"]},
     0x140001820: {"strings": [], "constants": ["0x1000193", "0x811c9dc5"],
-                  "api_calls": []},   # FNV-1a prime + offset basis
-    0x140001D00: {"strings": [], "constants": ["0xedb88320"], "api_calls": []},  # CRC32
+                  "classified_constants": ["0x1000193 (FNV-1a prime)",
+                                           "0x811c9dc5 (FNV-1a offset basis)"],
+                  "api_calls": []},
+    0x140001D00: {"strings": [], "constants": ["0xedb88320"],
+                  "classified_constants": ["0xedb88320 (CRC32 polynomial)"],
+                  "api_calls": []},
     0x140001B40: {"strings": ["POST /api/telemetry"], "constants": [],
-                  "api_calls": ["send", "htons"]},
+                  "api_calls": ["ws2_32!send(SOCKET,char *,int,int)", "ws2_32!htons"],
+                  "callsite_snippets": ["0x140001b80 -> send: call cs:send"],
+                  "globals": ["reads/refs g_network_client at 0x140030010"]},
 }
 
 
@@ -197,9 +206,9 @@ def name_variables(pseudocode: str, lvars: list[dict]) -> dict:
             for lv in lvars if lv["name"] in _DEMO_VAR_NAMES}
 
 
-def name_function_and_vars(pseudocode: str, lvars: list[dict],
-                           callees: list, callers: list) -> dict:
-    """Combined demo response — one 'call' returns name + reason + ret_type + vars."""
+def name_function_staged(pseudocode: str, lvars: list[dict],
+                         callees: list, callers: list, history=None) -> dict:
+    """Staged demo response — the fake model 'concludes' name + reason + ret_type + vars."""
     return {
         "name": "apply_fall_damage",
         "reason": "Subtracts a delta from a float health field and respawns when it "

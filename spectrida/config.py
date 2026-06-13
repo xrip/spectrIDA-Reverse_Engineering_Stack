@@ -23,12 +23,16 @@ _ONBOARD_MARKER = CONFIG_DIR / ".onboarded"
 
 _DEFAULT = {
     "ida":      {"idalib": "", "output_dir": str(CONFIG_DIR / "output")},
-    "ollama":   {"base_url": "http://localhost:8080", "model": "spectrida-re"},
+    "llamacpp": {"base_url": "http://localhost:8080", "model": "spectrida-re"},
     "pipeline": {"workers": 16, "batch_concurrency": 1},
 }
 
+_CONFIG_ERROR = ""
+
 
 def _load() -> dict:
+    global _CONFIG_ERROR
+    _CONFIG_ERROR = ""
     if tomllib is None or not CONFIG_FILE.exists():
         return {k: dict(v) for k, v in _DEFAULT.items()}
     try:
@@ -45,11 +49,21 @@ def _load() -> dict:
             else:
                 result[section] = values
         return result
-    except Exception:
+    except Exception as e:
+        _CONFIG_ERROR = f"{CONFIG_FILE}: {e}"
         return {k: dict(v) for k, v in _DEFAULT.items()}
 
 
 _cfg = _load()
+
+
+def reload_config() -> None:
+    global _cfg
+    _cfg = _load()
+
+
+def config_error() -> str:
+    return _CONFIG_ERROR
 
 
 def get(section: str, key: str, env_var: str | None = None) -> str:
@@ -70,12 +84,12 @@ def output_dir() -> Path:
     return p
 
 
-def ollama_url() -> str:
-    return get("ollama", "base_url", "SPECTRIDA_OLLAMA_URL") or "http://localhost:8080"
+def llamacpp_url() -> str:
+    return get("llamacpp", "base_url", "SPECTRIDA_LLAMACPP_URL") or "http://localhost:8080"
 
 
-def ollama_model() -> str:
-    return get("ollama", "model", "SPECTRIDA_MODEL") or "spectrida-re"
+def llamacpp_model() -> str:
+    return get("llamacpp", "model", "SPECTRIDA_LLAMACPP_MODEL") or "spectrida-re"
 
 
 def pipeline_workers() -> int:
@@ -83,6 +97,59 @@ def pipeline_workers() -> int:
         return int(get("pipeline", "workers", "SPECTRIDA_WORKERS") or 16)
     except ValueError:
         return 16
+
+
+def llm_max_tokens() -> int:
+    """Max tokens for a naming reply. MUST exceed the llama-server --reasoning-budget,
+    or the model spends its whole output thinking and the answer gets truncated
+    (an unclosed <think> with no name). Default 8192 leaves room after a 4096 budget.
+    """
+    try:
+        n = int(get("llamacpp", "max_tokens", "SPECTRIDA_LLAMACPP_MAX_TOKENS") or 8192)
+    except ValueError:
+        n = 8192
+    return max(512, n)
+
+
+def llm_temperature() -> float:
+    try:
+        t = float(get("llamacpp", "temperature", "SPECTRIDA_LLAMACPP_TEMPERATURE") or 0.0)
+    except ValueError:
+        t = 0.0
+    return max(0.0, min(2.0, t))
+
+
+def llm_top_p() -> float | None:
+    raw = get("llamacpp", "top_p", "SPECTRIDA_LLAMACPP_TOP_P").strip()
+    if not raw:
+        return 0.9
+    try:
+        p = float(raw)
+    except ValueError:
+        return 0.9
+    return max(0.0, min(1.0, p))
+
+
+def llm_top_k() -> int | None:
+    raw = get("llamacpp", "top_k", "SPECTRIDA_LLAMACPP_TOP_K").strip()
+    if not raw:
+        return 1
+    try:
+        k = int(raw)
+    except ValueError:
+        return 1
+    return max(0, k)
+
+
+def llamacpp_anthropic_version() -> str:
+    return (
+        get("llamacpp", "anthropic_version", "SPECTRIDA_LLAMACPP_ANTHROPIC_VERSION").strip()
+        or "2023-06-01"
+    )
+
+
+def llamacpp_api_key() -> str:
+    return get("llamacpp", "api_key", "SPECTRIDA_LLAMACPP_API_KEY").strip()
 
 
 def batch_concurrency() -> int:
@@ -130,14 +197,25 @@ def write_config(idalib: str = "", model: str = "spectrida-re") -> Path:
         "# spectrIDA configuration - https://github.com/ggfuchsi-oss/spectrIDA\n\n"
         f"[ida]\n{ida_line}"
         f'output_dir = "{output_dir().as_posix()}"\n\n'
-        "[ollama]\n"
+        "[llamacpp]\n"
         'base_url = "http://localhost:8080"\n'
-        f'model = "{model}"\n\n'
+        f'model = "{model}"\n'
+        "# Anthropic Messages API: POST /v1/messages\n"
+        "# must exceed server-side reasoning budget, or answers get truncated\n"
+        "max_tokens = 8192\n"
+        "# strict coding-agent sampling defaults\n"
+        "temperature = 0.0\n"
+        "top_p = 0.9\n"
+        "top_k = 1\n"
+        "# optional token for llama-server --api-key or compatible gateways\n"
+        '# api_key = ""\n'
+        'anthropic_version = "2023-06-01"\n\n'
         "[pipeline]\nworkers = 16\n"
         "# parallel AI naming requests in batch (1..4; needs llama-server --parallel N)\n"
         "# batch_concurrency = 1\n",
         encoding="utf-8",
     )
+    reload_config()
     return CONFIG_FILE
 
 
@@ -150,14 +228,23 @@ def write_default_config() -> Path:
             '# Path to the IDA install dir containing idalib.dll / libidalib.so\n'
             '# idalib = "C:/Program Files/IDA Professional 9.1"\n'
             f'output_dir = "{output_dir().as_posix()}"\n\n'
-            "[ollama]\n"
+            "[llamacpp]\n"
             'base_url = "http://localhost:8080"\n'
-            "# run: ollama pull hf.co/gdfhhjk/spectrida-re-gguf\n"
+            "# Anthropic Messages API: POST /v1/messages\n"
             'model = "spectrida-re"\n\n'
+            "# must exceed server-side reasoning budget, or answers get truncated\n"
+            "max_tokens = 8192\n"
+            "# strict coding-agent sampling defaults\n"
+            "temperature = 0.0\n"
+            "top_p = 0.9\n"
+            "top_k = 1\n"
+            '# api_key = ""\n'
+            'anthropic_version = "2023-06-01"\n\n'
             "[pipeline]\n"
             "workers = 16\n"
             "# parallel AI naming requests in batch (1..4; needs llama-server --parallel N)\n"
             "# batch_concurrency = 1\n",
             encoding="utf-8",
         )
+        reload_config()
     return CONFIG_FILE

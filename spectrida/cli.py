@@ -11,7 +11,7 @@ app = typer.Typer(add_completion=False, help="Ghost through binaries — paralle
 @app.callback(invoke_without_command=True)
 def _root(
     ctx: typer.Context,
-    demo: bool = typer.Option(False, "--demo", help="Run the TUI on canned data (no IDA/Ollama)."),
+    demo: bool = typer.Option(False, "--demo", help="Run the TUI on canned data (no IDA/llama.cpp)."),
     no_onboard: bool = typer.Option(False, "--no-onboard", help="Skip the first-run wizard."),
 ):
     from spectrida import config
@@ -152,22 +152,22 @@ def overview(
 
 @app.command()
 def serve():
-    """Check Ollama + the model are ready."""
+    """Check llama.cpp server + the model are ready."""
     import asyncio
 
-    from spectrida.config import ollama_model
-    from spectrida.core.services import ensure_model_loaded, ensure_ollama, model_present
+    from spectrida.config import llamacpp_model, llamacpp_url
+    from spectrida.core.services import ensure_llamacpp, ensure_model_loaded, model_present
 
     async def _check():
-        if not await ensure_ollama():
-            typer.echo("✗ Ollama not reachable. Install: https://ollama.com/download", err=True)
+        if not await ensure_llamacpp():
+            typer.echo(f"✗ llama.cpp server not reachable at {llamacpp_url()}", err=True)
             raise typer.Exit(1)
-        typer.echo("● Ollama up")
+        typer.echo("● llama.cpp server up")
         if await model_present():
             await ensure_model_loaded()
-            typer.echo(f"● {ollama_model()} ready")
+            typer.echo(f"● {llamacpp_model()} ready")
         else:
-            typer.echo(f"✗ {ollama_model()} not pulled — ollama pull hf.co/gdfhhjk/spectrida-re-gguf", err=True)
+            typer.echo(f"✗ {llamacpp_model()} did not answer a /v1/messages ping", err=True)
 
     asyncio.run(_check())
 

@@ -12,6 +12,7 @@ venv/
 .ruff_cache/
 
 # IDA databases & sidecars (never commit binaries/analysis)
+*.exe
 *.i64
 *.idb
 *.id0
@@ -25,3 +26,4 @@ output/
 
 # env / secrets
 .env
+*.bat

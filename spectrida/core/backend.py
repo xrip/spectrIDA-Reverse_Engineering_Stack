@@ -1,4 +1,4 @@
-"""The data backend the TUI talks to — real (idalib + Ollama) or demo (canned).
+"""The data backend the TUI talks to — real (idalib + llama.cpp) or demo (canned).
 
 Screens never branch on demo-vs-real; they hold a Backend and call its async
 methods. `stream_name` takes everything either backend might need; each uses
@@ -11,7 +11,7 @@ from pathlib import Path
 
 from spectrida.core import demo as _demo
 from spectrida.core import ida as _ida
-from spectrida.core import ollama as _ollama
+from spectrida.core import llamacpp as _llamacpp
 
 
 class Backend:
@@ -32,7 +32,8 @@ class Backend:
     async def get_func_meta(self, addr) -> dict: ...
     async def rename_lvars(self, addr, names: dict, ret_type: str = "") -> dict: ...
     async def name_variables(self, pseudocode: str, lvars: list[dict]) -> dict: ...
-    async def name_function_and_vars(self, pseudocode, lvars, callees, callers, hints=None) -> dict: ...
+    async def name_function_staged(self, pseudocode, lvars, callees, callers,
+                                   hints=None, history=None) -> dict: ...
     def stream_name(self, addr, insns, callees, callers) -> AsyncIterator[str]: ...
     async def close(self) -> None: ...
 
@@ -65,13 +66,15 @@ class RealBackend(Backend):
         return await _ida.rename_lvars(self._ida, addr, names, ret_type)
 
     async def name_variables(self, pseudocode, lvars):
-        return await _ollama.name_variables(pseudocode, lvars)
+        return await _llamacpp.name_variables(pseudocode, lvars)
 
-    async def name_function_and_vars(self, pseudocode, lvars, callees, callers, hints=None):
-        return await _ollama.name_function_and_vars(pseudocode, lvars, callees, callers, hints)
+    async def name_function_staged(self, pseudocode, lvars, callees, callers,
+                                   hints=None, history=None):
+        return await _llamacpp.name_function_staged(
+            pseudocode, lvars, callees, callers, hints, history)
 
     def stream_name(self, addr, insns, callees, callers):
-        return _ollama.stream_name(insns, callees, callers)
+        return _llamacpp.stream_name(insns, callees, callers)
 
     async def close(self):
         if self._ida:
@@ -107,8 +110,9 @@ class DemoBackend(Backend):
     async def name_variables(self, pseudocode, lvars):
         return _demo.name_variables(pseudocode, lvars)
 
-    async def name_function_and_vars(self, pseudocode, lvars, callees, callers, hints=None):
-        return _demo.name_function_and_vars(pseudocode, lvars, callees, callers)
+    async def name_function_staged(self, pseudocode, lvars, callees, callers,
+                                   hints=None, history=None):
+        return _demo.name_function_staged(pseudocode, lvars, callees, callers, history=history)
 
     def stream_name(self, addr, insns, callees, callers):
         return _demo.stream_name(addr)

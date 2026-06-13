@@ -202,23 +202,27 @@ class BrowserScreen(Screen):
             spin.update("  ▸ thinking…")
             res.update("")
             rsn.update("")
+            from spectrida.core.llamacpp import extract_name, strip_think
             full = ""
             async for tok in self._b.stream_name(
                     self._cur["start"], self._insns, self._callees, self._callers):
                 full += tok
-                if "REASON:" in full:
-                    name_part, _, reason_part = full.partition("REASON:")
+                shown = strip_think(full)        # never render a raw/truncated <think>
+                if "REASON:" in shown:
+                    name_part, _, reason_part = shown.partition("REASON:")
                     res.update(
                         f"  ► [b green]{name_part.replace('NAME:', '').strip()}[/]")
                     rsn.update(f"\n  {reason_part.strip()}")
-                elif "NAME:" in full:
+                elif "NAME:" in shown:
                     res.update(
-                        f"  ► [b green]{full.replace('NAME:', '').strip()}[/]")
+                        f"  ► [b green]{shown.replace('NAME:', '').strip()}[/]")
+                elif not shown:
+                    spin.update("  ▸ thinking…")   # still inside <think>, no answer yet
             spin.update("")
-            from spectrida.core.ollama import extract_name
             self._suggested = extract_name(full)
             if full and not self._suggested:
-                res.update(f"  [dim]{full[:300]}[/]")
+                shown = strip_think(full)
+                res.update(f"  [dim]{shown[:300] or '(model produced only reasoning — try again or raise SPECTRIDA_LLAMACPP_MAX_TOKENS)'}[/]")
         except Exception as e:
             try:
                 self.query_one("#model-spinner", Static).update("")
@@ -248,18 +252,21 @@ class BrowserScreen(Screen):
         self.query_one("#model-hint", Static).update("")
         res.update("")
         rsn.update("")
-        spin.update("  ▸ naming variables…")
+        spin.update("  ▸ staged: name → params → locals + return…")
         try:
             db = IDADatabase(self._b)
-            result = await db.name_variables(self._cur["start"], rename=True)
+            # staged conversation for context, but DON'T commit the function rename
+            result = await db.name_all(self._cur["start"], rename=True, rename_function=False)
             spin.update("")
-            mapping = result.get("mapping", {})
-            if not mapping:
+            mapping = result.get("variables", {})
+            n = result.get("renamed_vars", 0)
+            t = result.get("retyped_vars", 0)
+            ret = result.get("ret_type", "")
+            if not mapping and not ret:
                 res.update("  [dim]no variables to name (needs Hex-Rays, or none found).[/]")
                 return
-            n = result.get("renamed", 0)
-            t = result.get("retyped", 0)
-            res.update(f"  [b green]{n}[/] renamed · [b magenta]{t}[/] typed")
+            ret_part = f" · ret [b magenta]{ret}[/]" if ret else ""
+            res.update(f"  [b green]{n}[/] renamed · [b magenta]{t}[/] typed{ret_part}")
             rsn.update("\n  " + "  ".join(_var_change(k, v) for k, v in mapping.items()))
             # auto-show the updated pseudocode
             code = result.get("pseudocode", "")
@@ -317,7 +324,7 @@ class BrowserScreen(Screen):
             by_addr = {f["start"]: f for f in fl._all}
             total = len(targets)
             conc = batch_concurrency()
-            state = {"done": 0, "vars": 0, "typed": 0}
+            state = {"done": 0, "named": 0, "vars": 0, "typed": 0}
             sem = asyncio.Semaphore(conc)
             tag = f"  ×{conc}" if conc > 1 else ""
             self.query_one("#model-spinner", Static).update(f"  ▸ batch{tag or ' '}running…")
@@ -329,14 +336,15 @@ class BrowserScreen(Screen):
                 name = r.get("new_name")
                 tgt = by_addr.get(r["address"], f)
                 if name:
+                    state["named"] += 1
                     tgt["name"] = name                # same dict FuncList holds → mutates in place
                     fl.refresh()                      # repaint the list immediately
                     self._refresh_func_count()
                 state["vars"] += r.get("renamed_vars", 0)
                 state["typed"] += r.get("retyped_vars", 0)
                 state["done"] += 1
-                bar.set_progress(state["done"], total, name or tgt["name"])
-                res.update(f"  [green]{state['done']}/{total}[/] named · "
+                bar.set_progress(state["done"], total, name or "(no name)")
+                res.update(f"  [green]{state['named']}/{state['done']}[/] named · "
                            f"[cyan]{state['vars']}[/] vars · [magenta]{state['typed']}[/] typed{tag}")
 
             await asyncio.gather(*(_name_one(f) for f in targets))
@@ -346,7 +354,7 @@ class BrowserScreen(Screen):
             fl.refresh()
             self._refresh_func_count()
             bar.clear_progress()
-            bar.set_info(f"{self._b.title} · batch done — {state['done']} named, "
+            bar.set_info(f"{self._b.title} · batch done — {state['named']}/{state['done']} named, "
                          f"{state['vars']} vars, {state['typed']} typed")
         finally:
             self._busy = False
@@ -386,20 +394,24 @@ class BrowserScreen(Screen):
             from spectrida.api import IDADatabase
             db = IDADatabase(self._b)
             root = self._cur["start"]
-            state = {"vars": 0, "typed": 0}
+            state = {"named": 0, "skipped": 0, "vars": 0, "typed": 0}
 
             async def cb(done: int, total: int, r: dict) -> None:
                 name = r.get("new_name")
                 tgt = by_addr.get(r["address"])
-                if name and tgt:
-                    tgt["name"] = name
-                    fl.refresh()
-                    self._refresh_func_count()
+                if name:
+                    state["named"] += 1
+                    if tgt:
+                        tgt["name"] = name
+                        fl.refresh()
+                        self._refresh_func_count()
+                else:
+                    state["skipped"] += 1          # model produced no usable name
                 state["vars"] += r.get("renamed_vars", 0)
                 state["typed"] += r.get("retyped_vars", 0)
-                bar.set_progress(done, total, name or "")
+                bar.set_progress(done, total, name or "(no name)")
                 spin.update(f"  ▸ deep {done}/{total} (bottom-up)")
-                res.update(f"  [green]{done}/{total}[/] named · "
+                res.update(f"  [green]{state['named']}[/] named · "
                            f"[cyan]{state['vars']}[/] vars · [magenta]{state['typed']}[/] typed")
 
             results = await db.name_branch(root, rename=True, progress_cb=cb)
@@ -407,12 +419,18 @@ class BrowserScreen(Screen):
             if not results:
                 res.update("  [dim]nothing to name in this branch (all named already).[/]")
             else:
-                rsn.update(f"\n  branch done — {len(results)} functions, "
+                skip = f", {state['skipped']} skipped" if state["skipped"] else ""
+                rsn.update(f"\n  branch done — {state['named']}/{len(results)} named{skip}, "
                            f"{state['vars']} vars, {state['typed']} typed  ·  {voice.quip('naming_done')}")
             fl.refresh()
             self._refresh_func_count()
+            # refresh the function we're looking at so its header + body show the new
+            # names of the callees we just resolved (the DB changed under the view)
+            if self._cur:
+                self._decompiled = False
+                await self._load_disasm()
             bar.clear_progress()
-            bar.set_info(f"{self._b.title} · deep branch — {len(results)} named, "
+            bar.set_info(f"{self._b.title} · deep branch — {state['named']} named, "
                          f"{state['vars']} vars, {state['typed']} typed")
         except Exception as e:
             spin.update("")

@@ -53,7 +53,7 @@ to use. **199 downloads speak for themselves.**
 
 - **Parallel sharded analysis** — splits into address-space shards, runs N idalib instances,
   merges into one `.i64`. Workers configurable via flag, config, or env var.
-- **AI function naming** — fine-tuned Qwen3-8B runs locally via Ollama, streams names
+- **AI function naming** — fine-tuned Qwen3-8B runs locally via llama.cpp server, streams names
   token-by-token. Press `N`. Watch it think. Name appears.
 - **Batch naming** — `B` to name every `sub_*` function in the list. Walk away. Come back.
 - **Binary overview** — press `O` or run `spectrida overview file.i64`. Model reads 120
@@ -66,8 +66,8 @@ to use. **199 downloads speak for themselves.**
   The `.idc` applies all AI-generated names back into any IDA install in one click.
 - **Programmatic API** — `from spectrida.api import open_i64`. Drive everything from scripts,
   notebooks, or Claude Code without touching the TUI.
-- **Demo mode** (`spectrida --demo`) — try the whole thing with **zero setup**. No IDA, no Ollama.
-- **A first-run wizard** — helps you install Ollama + the model, detects your IDA install
+- **Demo mode** (`spectrida --demo`) — try the whole thing with **zero setup**. No IDA, no llama.cpp server.
+- **A first-run wizard** — helps you check llama.cpp server + the model, detects your IDA install
   automatically, then never asks again.
 
 ---
@@ -78,14 +78,12 @@ to use. **199 downloads speak for themselves.**
 pip install spectrida
 ```
 
-Requirements: **IDA Pro 9.x** with idalib · **Python 3.10+** · **Ollama**
+Requirements: **IDA Pro 9.x** with idalib · **Python 3.10+** · **llama.cpp server**
 
 ```bash
-# install Ollama (Windows)
-winget install Ollama.Ollama
-
-# pull the model (8.7 GB — go get coffee)
-ollama pull hf.co/gdfhhjk/spectrida-re-gguf
+# start llama-server with your GGUF model
+llama-server -m spectrida-re.gguf --host 127.0.0.1 --port 8080 --ctx-size 32768 \
+  --cache-prompt --parallel 1
 
 # first run — detects your IDA install and sets everything up
 spectrida onboard
@@ -117,7 +115,7 @@ spectrida export file.i64 -f csv           # spreadsheet
 spectrida export file.i64 -f symbols       # addr name pairs
 spectrida export file.i64 --named-only     # skip sub_* functions
 
-# check Ollama + model status
+# check llama.cpp server + model status
 spectrida serve
 
 # re-run the setup wizard
@@ -192,7 +190,7 @@ fine-tuned for reverse engineering.
 **Training approach:** neuron-targeted SFT + GRPO. Only the RE-relevant neurons are tuned —
 base Qwen3 knowledge stays intact, you just added a very specific skill on top.
 
-Runs locally via Ollama. GGUF — works on CPU, GPU, or both.
+Runs locally via llama.cpp server. GGUF — works on CPU, GPU, or both.
 
 ---
 
@@ -228,15 +226,20 @@ interesting 20%. It's the orientation layer.
 idalib = "C:/Program Files/IDA Professional 9.1"
 output_dir = "~/.spectrida/output"
 
-[ollama]
-base_url = "http://localhost:11434"
-model = "spectrida-re"   # any ollama model name works
+[llamacpp]
+base_url = "http://localhost:8080"
+model = "spectrida-re"
+max_tokens = 8192
+# Anthropic Messages API: POST /v1/messages
+# optional auth for llama-server --api-key or compatible gateways
+# api_key = ""
+anthropic_version = "2023-06-01"
 
 [pipeline]
 workers = 16
 ```
 
-Env var overrides: `SPECTRIDA_IDALIB` · `SPECTRIDA_MODEL` · `SPECTRIDA_WORKERS` · `SPECTRIDA_OLLAMA_URL`
+Env var overrides: `SPECTRIDA_IDALIB` · `SPECTRIDA_LLAMACPP_MODEL` · `SPECTRIDA_LLAMACPP_URL` · `SPECTRIDA_LLAMACPP_API_KEY` · `SPECTRIDA_WORKERS`
 
 ---
 

@@ -23,7 +23,12 @@ from pathlib import Path
 from typing import TypedDict
 
 from spectrida.core.backend import DemoBackend, RealBackend
-from spectrida.core.ollama import extract_name, name_function, stream_name
+from spectrida.core.llamacpp import (
+    extract_name,
+    llamacpp_stream_text,
+    name_function,
+    stream_name,
+)
 
 
 # ── public types ────────────────────────────────────────────────────────────
@@ -284,24 +289,37 @@ class IDADatabase:
                 await progress_cb(i + 1, len(targets), r)
         return results
 
-    # ── combined: function + variables in one LLM call ───────────────────────
+    # ── staged conversation: name → params → locals + return ─────────────────
 
     async def name_all(
         self,
         address: int | str,
         *,
         rename: bool = False,
+        rename_function: bool = True,
+        llm_history: list[dict] | None = None,
     ) -> dict:
-        """Name the function AND its locals/params in a SINGLE LLM call.
+        """Name + type a function via a 3-stage LLM CONVERSATION.
 
-        Uses Hex-Rays pseudocode when available (richer context, one round-trip).
-        Falls back to disassembly-based naming (function name only — variables need
-        a decompiler) when there's no pseudocode, OR when the pseudocode pass came
-        back without a usable function name.
+        Stage 1 names the function, Stage 2 names+types the parameters, Stage 3
+        names+types the locals and infers the return type — each stage building on
+        the model's own prior answers (see core.llamacpp.name_function_staged).
+
+        Uses Hex-Rays pseudocode when available; falls back to disassembly-based
+        naming (function name only — variables need a decompiler) when there's no
+        pseudocode, OR when Stage 1 produced no usable name.
+
+        Args:
+            rename:          persist results to the .i64
+            rename_function: when False, apply variable/param/return types but DON'T
+                             commit the function rename (Stage 1 still runs for
+                             context). Used by the interactive "type variables" action.
+            llm_history:      optional chat history to reuse across related functions
+                             (used by bottom-up branch naming).
 
         Returns:
-            {address, old_name, new_name, reasoning, variables,
-             renamed_vars, pseudocode, source}
+            {address, old_name, new_name, reasoning, variables, ret_type,
+             renamed_vars, retyped_vars, pseudocode, source}
         where *source* is "pseudocode", "disasm", or "pseudocode+disasm".
         """
         a = address if isinstance(address, int) else int(address, 16)
@@ -328,17 +346,18 @@ class IDADatabase:
         variables: dict = {}
         source = ""
 
-        # Preferred path: one combined call over the decompiler pseudocode.
+        # Preferred path: staged conversation over the decompiler pseudocode.
         if _has_pseudocode(pseudocode):
-            combined = await self._b.name_function_and_vars(pseudocode, lvars, callees, callers, hints)
-            new_name  = combined.get("name", "")
-            reasoning = combined.get("reason", "")
-            ret_type  = combined.get("ret_type", "")
-            variables = combined.get("variables", {})
+            staged = await self._b.name_function_staged(
+                pseudocode, lvars, callees, callers, hints, llm_history)
+            new_name  = staged.get("name", "")
+            reasoning = staged.get("reason", "")
+            ret_type  = staged.get("ret_type", "")
+            variables = staged.get("variables", {})
             source = "pseudocode"
 
         # Fallback path: DISASM. Triggers when there's no decompiler at all, or the
-        # pseudocode pass produced no name. Variables can't be named without a
+        # staged pass produced no name. Variables can't be named without a
         # decompiler, so any vars found above are preserved.
         if not new_name:
             insns = await self.disasm(a)
@@ -354,7 +373,7 @@ class IDADatabase:
         retyped_vars = 0
         applied_ret = ""
         if rename:
-            if new_name:
+            if new_name and rename_function:
                 await self.rename(a, new_name)
             if variables or ret_type:
                 r = await self._b.rename_lvars(a, variables, ret_type=ret_type)
@@ -426,8 +445,9 @@ class IDADatabase:
                    if ad in by_addr and (not unnamed_only
                                          or by_addr[ad]["name"].lower().startswith("sub_"))]
         results: list[dict] = []
+        branch_history: list[dict] = []
         for i, ad in enumerate(targets):
-            r = await self.name_all(ad, rename=rename)
+            r = await self.name_all(ad, rename=rename, llm_history=branch_history)
             results.append(r)
             if progress_cb:
                 await progress_cb(i + 1, len(targets), r)
@@ -509,8 +529,6 @@ class IDADatabase:
 
         Returns the full overview string, or an async iterator if stream=True.
         """
-        from spectrida.config import ollama_model, ollama_url
-
         funcs = await self.list_functions()
 
         # weighted sample: bigger functions are more likely to be interesting
@@ -556,33 +574,12 @@ class IDADatabase:
             "say so and give your best guess from patterns you can see."
         )
 
-        import httpx
-        payload = {
-            "model": ollama_model(),
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": True,
-            "temperature": 0.3,
-            "max_tokens": 2048,
-        }
-
         async def _token_stream() -> AsyncIterator[str]:
-            async with httpx.AsyncClient(timeout=120) as client:
-                async with client.stream(
-                    "POST", f"{ollama_url()}/v1/chat/completions", json=payload
-                ) as resp:
-                    async for line in resp.aiter_lines():
-                        if not line or not line.startswith("data: "):
-                            continue
-                        data = line[6:]
-                        if data.strip() == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-                        content = (chunk.get("choices") or [{}])[0].get("delta", {}).get("content")
-                        if content:
-                            yield content
+            async for tok in llamacpp_stream_text(
+                [{"role": "user", "content": prompt}],
+                temperature=None,
+            ):
+                yield tok
 
         if stream:
             return _token_stream()

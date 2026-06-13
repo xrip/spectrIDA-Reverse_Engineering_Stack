@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upload a GGUF (e.g. from Ollama's blob store) to a HuggingFace repo.
+"""Upload a GGUF file to a HuggingFace repo.
 
     python scripts/upload_gguf.py --blob <path> --repo gdfhhjk/spectrida-re-gguf
 
@@ -11,7 +11,7 @@ from pathlib import Path
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--blob", required=True, help="Path to the .gguf / Ollama blob file")
+    ap.add_argument("--blob", required=True, help="Path to the .gguf file")
     ap.add_argument("--repo", required=True, help="HF repo id, e.g. user/model-gguf")
     ap.add_argument("--name", default="model-Q4_K_M.gguf", help="Filename in the repo")
     ap.add_argument("--private", action="store_true")

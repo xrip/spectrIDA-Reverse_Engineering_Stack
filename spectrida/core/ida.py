@@ -233,15 +233,70 @@ for line in sys.stdin:
                 ea = _norm(addr); out[hex(ea)] = _proto(ea)
             emit({"ok": True, "result": out})
         elif cmd == "func_meta":
-            # extra naming hints: referenced strings, notable constants, API calls
+            # extra naming hints: compact RE facts that help the model name and type
+            # the function without dumping unbounded disassembly into the prompt.
             addr = _norm(a["address"]); fn = idaapi.get_func(addr)
-            strings = []; consts = []; apis = []
-            ss = set(); sc = set(); sa = set()
+            strings = []; consts = []; classified_consts = []; apis = []
+            callsites = []; caller_sites = []; globals_ = []; fields = []
+            ss = set(); sc = set(); scc = set(); sa = set()
+            scall = set(); scaller = set(); sg = set(); sf = set()
+
+            def _line(ea):
+                try:
+                    return " ".join((idc.generate_disasm_line(ea, 0) or "").split())
+                except Exception:
+                    return ""
+
+            def _add(out, seen, value, limit):
+                if value and value not in seen and len(out) < limit:
+                    seen.add(value); out.append(value)
+
+            def _const_hint(v):
+                v32 = v & 0xFFFFFFFF
+                known = {
+                    0xEDB88320: "CRC32 polynomial",
+                    0x04C11DB7: "CRC32 polynomial",
+                    0x811C9DC5: "FNV-1a offset basis",
+                    0x01000193: "FNV-1a prime",
+                    0x9E3779B9: "golden-ratio hash constant",
+                    0xDEADBEEF: "debug/sentinel constant",
+                    0xFFFFFFFF: "all-bits-set / -1",
+                }
+                if v32 in known:
+                    return "%s (%s)" % (hex(v32), known[v32])
+                if v in known:
+                    return "%s (%s)" % (hex(v), known[v])
+                return ""
+
+            def _api_label(ea, nm):
+                proto = _proto(ea)
+                try:
+                    seg = idc.get_segm_name(ea) or ""
+                except Exception:
+                    seg = ""
+                label = proto or nm
+                if seg and seg.lower() not in (".text", "text", "code"):
+                    return "%s!%s" % (seg, label)
+                return label
+
+            facts = {}
             if fn:
-                for ea in idautils.FuncItems(fn.start_ea):
-                    if len(ss) >= 20 and len(sc) >= 16 and len(sa) >= 20:
-                        break
-                    # referenced string literals
+                items = list(idautils.FuncItems(fn.start_ea))
+                out_calls = 0
+                facts = {
+                    "size": fn.size(),
+                    "instruction_count": len(items),
+                    "leaf": True,
+                }
+
+                for ea in items:
+                    line = _line(ea)
+                    try:
+                        mnem = (idc.print_insn_mnem(ea) or "").lower()
+                    except Exception:
+                        mnem = ""
+
+                    # referenced string literals and other global/data references
                     for dr in idautils.DataRefsFrom(ea):
                         try:
                             raw = idc.get_strlit_contents(dr, -1, 0)
@@ -251,27 +306,98 @@ for line in sys.stdin:
                             try: s = raw.decode("utf-8", "replace")
                             except Exception: s = str(raw)
                             s = s.strip()
-                            if s and s not in ss and len(ss) < 20:
-                                ss.add(s); strings.append(s)
-                    # notable immediate constants (skip small offsets/flags)
-                    for opi in (0, 1):
+                            _add(strings, ss, s, 20)
+                            continue
+
                         try:
-                            if idc.get_operand_type(ea, opi) == idc.o_imm:
-                                v = idc.get_operand_value(ea, opi) & 0xFFFFFFFFFFFFFFFF
-                                if v >= 0x80 and v not in sc and len(sc) < 16:
-                                    sc.add(v); consts.append(hex(v))
+                            nm = idc.get_name(dr) or ""
                         except Exception:
-                            pass
-                    # API / import calls (no body / thunk, real name)
+                            nm = ""
+                        if not nm:
+                            try:
+                                seg = idc.get_segm_name(dr) or "data"
+                            except Exception:
+                                seg = "data"
+                            nm = "%s:%s" % (seg, hex(dr))
+                        access = "writes" if (
+                            idc.get_operand_type(ea, 0) in (idc.o_mem, idc.o_displ)
+                            and idc.get_operand_value(ea, 0) == dr
+                            and mnem.startswith(("mov", "stos", "xchg"))
+                        ) else "reads/refs"
+                        _add(globals_, sg, "%s %s at %s" % (access, nm, hex(dr)), 16)
+
+                    # notable immediate constants and pointer/field-like operands
+                    for opi in (0, 1, 2):
+                        try:
+                            otype = idc.get_operand_type(ea, opi)
+                            op = idc.print_operand(ea, opi) or ""
+                        except Exception:
+                            continue
+                        if otype == idc.o_imm:
+                            v = idc.get_operand_value(ea, opi) & 0xFFFFFFFFFFFFFFFF
+                            if v >= 0x80:
+                                _add(consts, sc, hex(v), 16)
+                                _add(classified_consts, scc, _const_hint(v), 8)
+                        elif otype == idc.o_displ:
+                            lop = op.lower()
+                            if not any(r in lop for r in ("[rsp", "[esp", "[rbp", "[ebp")):
+                                _add(fields, sf, "%s in %s" % (op, line), 16)
+
+                    # outgoing calls/imports with the actual call instruction
                     for cr in idautils.CodeRefsFrom(ea, 0):
                         nm = idc.get_func_name(cr)
-                        if not nm or nm in sa or nm.startswith("sub_") or nm.startswith("j_"):
-                            continue
                         tf = idaapi.get_func(cr)
+                        if tf and tf.start_ea == fn.start_ea:
+                            continue
                         is_import = tf is None or bool(tf.flags & idaapi.FUNC_THUNK)
-                        if is_import and len(sa) < 20:
-                            sa.add(nm); apis.append(nm)
-            emit({"ok": True, "result": {"strings": strings, "constants": consts, "api_calls": apis}})
+                        if tf or nm:
+                            out_calls += 1
+                            facts["leaf"] = False
+                            label = _proto(tf.start_ea) if tf else ""
+                            label = label or nm or hex(cr)
+                            _add(callsites, scall, "%s -> %s: %s" % (hex(ea), label, line), 12)
+                        if nm and not nm.startswith("sub_") and not nm.startswith("j_") and is_import:
+                            _add(apis, sa, _api_label(cr, nm), 20)
+
+                facts["calls_out"] = out_calls
+
+                # how callers use this function, especially the return value
+                callers_count = 0
+                for xr in idautils.XrefsTo(fn.start_ea):
+                    cfn = idaapi.get_func(xr.frm)
+                    if not cfn:
+                        continue
+                    callers_count += 1
+                    if len(caller_sites) >= 12:
+                        continue
+                    caller = idc.get_func_name(cfn.start_ea) or hex(cfn.start_ea)
+                    off = xr.frm - cfn.start_ea
+                    parts = [_line(xr.frm)]
+                    try:
+                        n1 = idc.next_head(xr.frm, cfn.end_ea)
+                        if n1 != idc.BADADDR and n1 < cfn.end_ea:
+                            parts.append("next: " + _line(n1))
+                            n2 = idc.next_head(n1, cfn.end_ea)
+                            if n2 != idc.BADADDR and n2 < cfn.end_ea:
+                                parts.append("next2: " + _line(n2))
+                    except Exception:
+                        pass
+                    _add(caller_sites, scaller,
+                         "%s+0x%x: %s" % (caller, off, " ; ".join(p for p in parts if p)),
+                         12)
+                facts["callers"] = callers_count
+
+            emit({"ok": True, "result": {
+                "strings": strings,
+                "constants": consts,
+                "classified_constants": classified_consts,
+                "api_calls": apis,
+                "function_facts": facts,
+                "callsite_snippets": callsites,
+                "caller_return_usage": caller_sites,
+                "globals": globals_,
+                "field_accesses": fields,
+            }})
         elif cmd == "rename":
             ok = idc.set_name(_norm(a["address"]), a["name"], idc.SN_NOWARN | idc.SN_NOCHECK)
             emit({"ok": True, "result": bool(ok)})
@@ -324,6 +450,7 @@ class IDAHandle:
 
     async def _readresp(self) -> dict:
         # skip idapro's stdout noise; only @@RESP lines are ours
+        noise: list[str] = []
         while True:
             line = await self._proc.stdout.readline()
             if not line:
@@ -334,11 +461,18 @@ class IDAHandle:
                         stderr_out = raw.decode(errors="replace").strip()
                     except Exception:
                         pass
-                detail = f"\n--- idalib stderr ---\n{stderr_out}" if stderr_out else ""
+                stdout_out = "\n".join(noise[-20:])
+                detail = ""
+                if stdout_out:
+                    detail += f"\n--- idalib stdout ---\n{stdout_out}"
+                if stderr_out:
+                    detail += f"\n--- idalib stderr ---\n{stderr_out}"
                 raise RuntimeError(f"idalib worker exited unexpectedly{detail}")
             text = line.decode(errors="replace").strip()
             if text.startswith("@@RESP "):
                 return json.loads(text[len("@@RESP "):])
+            if text:
+                noise.append(text)
 
     async def call(self, cmd: str, **args):
         async with self._lock:
@@ -389,7 +523,12 @@ async def open_ida(i64_path: str) -> IDAHandle:
     handle = IDAHandle(proc, i64_path)
     ready = await handle._readresp()   # waits for the "ready" @@RESP
     if not ready.get("ok"):
-        raise RuntimeError("idalib worker failed to open the database")
+        detail = ready.get("result") or ready.get("error") or "unknown error"
+        try:
+            await handle.close()
+        except Exception:
+            pass
+        raise RuntimeError(f"idalib worker failed to open the database: {i64_path} ({detail})")
     return handle
 
 
