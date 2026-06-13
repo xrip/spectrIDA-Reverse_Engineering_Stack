@@ -36,10 +36,12 @@ class HelpScreen(ModalScreen[None]):
 
     _KEYS = [
         ("N", "name the selected function (AI)"),
+        ("V", "name locals + params (AI, needs Hex-Rays)"),
         ("R", "rename (pre-fills the AI suggestion)"),
         ("D", "toggle decompiled pseudocode"),
         ("C", "call chain — callers / callees"),
-        ("B", "batch-name selected sub_ functions"),
+        ("B", "batch-name functions + their variables"),
+        ("T", "deep-name the whole call branch (bottom-up)"),
         ("O", "overview — AI summary of the whole binary"),
         ("/", "fuzzy search"),
         ("ctrl+p", "command palette"),

@@ -23,8 +23,8 @@ _ONBOARD_MARKER = CONFIG_DIR / ".onboarded"
 
 _DEFAULT = {
     "ida":      {"idalib": "", "output_dir": str(CONFIG_DIR / "output")},
-    "ollama":   {"base_url": "http://localhost:11434", "model": "spectrida-re"},
-    "pipeline": {"workers": 16},
+    "ollama":   {"base_url": "http://localhost:8080", "model": "spectrida-re"},
+    "pipeline": {"workers": 16, "batch_concurrency": 1},
 }
 
 
@@ -71,7 +71,7 @@ def output_dir() -> Path:
 
 
 def ollama_url() -> str:
-    return get("ollama", "base_url", "SPECTRIDA_OLLAMA_URL") or "http://localhost:11434"
+    return get("ollama", "base_url", "SPECTRIDA_OLLAMA_URL") or "http://localhost:8080"
 
 
 def ollama_model() -> str:
@@ -83,6 +83,19 @@ def pipeline_workers() -> int:
         return int(get("pipeline", "workers", "SPECTRIDA_WORKERS") or 16)
     except ValueError:
         return 16
+
+
+def batch_concurrency() -> int:
+    """How many AI naming requests to run in parallel during batch (1 = sequential).
+
+    Clamped to 1..4. Parallelism only helps if llama-server was started with
+    multiple slots (e.g. --parallel 4); otherwise requests queue server-side.
+    """
+    try:
+        n = int(get("pipeline", "batch_concurrency", "SPECTRIDA_BATCH_CONCURRENCY") or 1)
+    except ValueError:
+        n = 1
+    return max(1, min(4, n))
 
 
 def pipeline_script() -> Path:
@@ -118,9 +131,11 @@ def write_config(idalib: str = "", model: str = "spectrida-re") -> Path:
         f"[ida]\n{ida_line}"
         f'output_dir = "{output_dir().as_posix()}"\n\n'
         "[ollama]\n"
-        'base_url = "http://localhost:11434"\n'
+        'base_url = "http://localhost:8080"\n'
         f'model = "{model}"\n\n'
-        "[pipeline]\nworkers = 16\n",
+        "[pipeline]\nworkers = 16\n"
+        "# parallel AI naming requests in batch (1..4; needs llama-server --parallel N)\n"
+        "# batch_concurrency = 1\n",
         encoding="utf-8",
     )
     return CONFIG_FILE
@@ -136,11 +151,13 @@ def write_default_config() -> Path:
             '# idalib = "C:/Program Files/IDA Professional 9.1"\n'
             f'output_dir = "{output_dir().as_posix()}"\n\n'
             "[ollama]\n"
-            'base_url = "http://localhost:11434"\n'
+            'base_url = "http://localhost:8080"\n'
             "# run: ollama pull hf.co/gdfhhjk/spectrida-re-gguf\n"
             'model = "spectrida-re"\n\n'
             "[pipeline]\n"
-            "workers = 16\n",
+            "workers = 16\n"
+            "# parallel AI naming requests in batch (1..4; needs llama-server --parallel N)\n"
+            "# batch_concurrency = 1\n",
             encoding="utf-8",
         )
     return CONFIG_FILE

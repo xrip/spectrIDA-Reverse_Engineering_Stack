@@ -70,6 +70,24 @@ def loading_line() -> str:
     return random.choice(_LOADING)
 
 
+def _fmt_xref(x: dict) -> str:
+    """Best label for a call-chain neighbour: full signature if the function has a
+    known type (gives the model params + return type), else its name, else addr."""
+    return x.get("proto") or x.get("name") or x.get("address", "")
+
+
+def _has_pseudocode(pseudocode: str) -> bool:
+    """True only if the decompiler produced real pseudocode.
+
+    Hex-Rays-less databases, decompile failures and demo stubs all come back as
+    either an empty string or a leading ``//`` comment (e.g. ``// lvars error: …``
+    or ``// (demo) no pseudocode``) — treat those as "no pseudocode" so callers
+    fall back to disassembly.
+    """
+    s = (pseudocode or "").strip()
+    return bool(s) and not s.startswith("//")
+
+
 # ── DB handle ────────────────────────────────────────────────────────────────
 
 class IDADatabase:
@@ -135,8 +153,8 @@ class IDADatabase:
         old_name = func["name"] if func else hex(a)
 
         insns   = await self.disasm(a)
-        callees = [x.get("name") or x["address"] for x in await self.xrefs_from(a)]
-        callers = [x.get("name") or x["address"] for x in await self.xrefs_to(a)]
+        callees = [_fmt_xref(x) for x in await self.xrefs_from(a)]
+        callers = [_fmt_xref(x) for x in await self.xrefs_to(a)]
 
         full = ""
         async for tok in self._b.stream_name(a, insns, callees, callers):
@@ -198,6 +216,277 @@ class IDADatabase:
                 await progress_cb(i + 1, len(targets), r)
         return results
 
+    # ── variable / parameter naming ──────────────────────────────────────────
+
+    async def name_variables(
+        self,
+        address: int | str,
+        *,
+        rename: bool = False,
+    ) -> dict:
+        """Ask the model to name locals + params in the function at *address*.
+
+        Requires Hex-Rays (decompiler). Returns:
+            {"mapping": {old: {"name","type"}}, "renamed": N, "retyped": M,
+             "pseudocode": str}
+        where *pseudocode* is the updated listing when rename=True, else the
+        original. *mapping* is empty if there's nothing to name or no decompiler.
+        """
+        a = address if isinstance(address, int) else int(address, 16)
+        info = await self._b.get_lvars(a)
+        pseudocode = info.get("pseudocode", "")
+        lvars = info.get("lvars", [])
+        if not lvars:
+            return {"mapping": {}, "renamed": 0, "retyped": 0, "pseudocode": pseudocode}
+
+        mapping = await self._b.name_variables(pseudocode, lvars)
+        if not mapping:
+            return {"mapping": {}, "renamed": 0, "retyped": 0, "pseudocode": pseudocode}
+
+        if rename:
+            result = await self._b.rename_lvars(a, mapping)
+            return {"mapping": mapping,
+                    "renamed": result.get("renamed", 0),
+                    "retyped": result.get("retyped", 0),
+                    "pseudocode": result.get("pseudocode", pseudocode)}
+        return {"mapping": mapping, "renamed": 0, "retyped": 0, "pseudocode": pseudocode}
+
+    async def batch_name_variables(
+        self,
+        *,
+        limit: int = 50,
+        named_only: bool = True,
+        rename: bool = True,
+        progress_cb=None,
+    ) -> list[dict]:
+        """Name locals + params across many functions.
+
+        Args:
+            limit:      max functions to process
+            named_only: only functions that already have a real name (skip sub_*),
+                        since a function you haven't named yet has little var context
+            rename:     persist variable names to the .i64
+            progress_cb: optional async callable(done, total, result)
+
+        Returns one result dict per function (see name_variables).
+        """
+        funcs = await self.list_functions()
+        targets = [f for f in funcs
+                   if not named_only or not f["name"].lower().startswith("sub_")]
+        targets = targets[:limit]
+        results: list[dict] = []
+        for i, f in enumerate(targets):
+            r = await self.name_variables(f["start"], rename=rename)
+            r["address"] = f["start"]
+            r["function"] = f["name"]
+            results.append(r)
+            if progress_cb:
+                await progress_cb(i + 1, len(targets), r)
+        return results
+
+    # ── combined: function + variables in one LLM call ───────────────────────
+
+    async def name_all(
+        self,
+        address: int | str,
+        *,
+        rename: bool = False,
+    ) -> dict:
+        """Name the function AND its locals/params in a SINGLE LLM call.
+
+        Uses Hex-Rays pseudocode when available (richer context, one round-trip).
+        Falls back to disassembly-based naming (function name only — variables need
+        a decompiler) when there's no pseudocode, OR when the pseudocode pass came
+        back without a usable function name.
+
+        Returns:
+            {address, old_name, new_name, reasoning, variables,
+             renamed_vars, pseudocode, source}
+        where *source* is "pseudocode", "disasm", or "pseudocode+disasm".
+        """
+        a = address if isinstance(address, int) else int(address, 16)
+        funcs = await self.list_functions()
+        func = next((f for f in funcs if f["start"] == a), None)
+        old_name = func["name"] if func else hex(a)
+
+        callees = [_fmt_xref(x) for x in await self.xrefs_from(a)]
+        callers = [_fmt_xref(x) for x in await self.xrefs_to(a)]
+
+        info = await self._b.get_lvars(a)
+        pseudocode = info.get("pseudocode", "")
+        lvars = info.get("lvars", [])
+
+        # extra naming signals: strings / API calls / constants (best-effort)
+        hints = None
+        if hasattr(self._b, "get_func_meta"):
+            try:
+                hints = await self._b.get_func_meta(a)
+            except Exception:
+                hints = None
+
+        new_name = reasoning = ret_type = ""
+        variables: dict = {}
+        source = ""
+
+        # Preferred path: one combined call over the decompiler pseudocode.
+        if _has_pseudocode(pseudocode):
+            combined = await self._b.name_function_and_vars(pseudocode, lvars, callees, callers, hints)
+            new_name  = combined.get("name", "")
+            reasoning = combined.get("reason", "")
+            ret_type  = combined.get("ret_type", "")
+            variables = combined.get("variables", {})
+            source = "pseudocode"
+
+        # Fallback path: DISASM. Triggers when there's no decompiler at all, or the
+        # pseudocode pass produced no name. Variables can't be named without a
+        # decompiler, so any vars found above are preserved.
+        if not new_name:
+            insns = await self.disasm(a)
+            full = "".join([t async for t in self._b.stream_name(a, insns, callees, callers)])
+            fb_name = extract_name(full) or ""
+            if fb_name:
+                new_name = fb_name
+                reasoning = reasoning or (
+                    full.partition("REASON:")[2].strip() if "REASON:" in full else "")
+            source = "pseudocode+disasm" if source == "pseudocode" else "disasm"
+
+        renamed_vars = 0
+        retyped_vars = 0
+        applied_ret = ""
+        if rename:
+            if new_name:
+                await self.rename(a, new_name)
+            if variables or ret_type:
+                r = await self._b.rename_lvars(a, variables, ret_type=ret_type)
+                renamed_vars = r.get("renamed", 0)
+                retyped_vars = r.get("retyped", 0)
+                applied_ret = r.get("ret_type", "")
+                pseudocode = r.get("pseudocode", pseudocode)
+
+        return {
+            "address": a, "old_name": old_name, "new_name": new_name,
+            "source": source,
+            "reasoning": reasoning, "variables": variables,
+            "ret_type": applied_ret or ret_type,
+            "renamed_vars": renamed_vars, "retyped_vars": retyped_vars,
+            "pseudocode": pseudocode,
+        }
+
+    async def name_branch(
+        self,
+        address: int | str,
+        *,
+        max_depth: int = 3,
+        max_funcs: int = 60,
+        unnamed_only: bool = True,
+        rename: bool = True,
+        progress_cb=None,
+    ) -> list[dict]:
+        """Deep-analyse a whole call branch, BOTTOM-UP.
+
+        Walks the callee tree from *address* and names the deepest functions first,
+        so by the time each caller is named its callees already have real names +
+        signatures — the model reasons over a resolved sub-tree instead of sub_*.
+
+        Args:
+            max_depth:    how deep to follow callees from the root
+            max_funcs:    safety cap on total functions visited
+            unnamed_only: only name sub_* functions (still traverses through named
+                          ones to reach unnamed descendants)
+            rename:       persist names to the .i64
+            progress_cb:  optional async callable(done, total, result)
+
+        Returns one result dict per named function (see name_all), leaves first.
+        Runs sequentially by design — each step feeds the next.
+        """
+        root = address if isinstance(address, int) else int(address, 16)
+        funcs = await self.list_functions()
+        by_addr = {f["start"]: f for f in funcs}
+
+        order: list[int] = []          # post-order: leaves first, root last
+        visited: set[int] = set()
+
+        async def _dfs(addr: int, depth: int) -> None:
+            if addr in visited or len(visited) >= max_funcs:
+                return
+            visited.add(addr)
+            if depth < max_depth:
+                for x in await self.xrefs_from(addr):
+                    try:
+                        ca = int(x["address"], 16) if isinstance(x.get("address"), str) else int(x["address"])
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    if ca in by_addr:
+                        await _dfs(ca, depth + 1)
+            order.append(addr)
+
+        await _dfs(root, 0)
+
+        targets = [ad for ad in order
+                   if ad in by_addr and (not unnamed_only
+                                         or by_addr[ad]["name"].lower().startswith("sub_"))]
+        results: list[dict] = []
+        for i, ad in enumerate(targets):
+            r = await self.name_all(ad, rename=rename)
+            results.append(r)
+            if progress_cb:
+                await progress_cb(i + 1, len(targets), r)
+        return results
+
+    async def batch_name_all(
+        self,
+        *,
+        limit: int = 50,
+        unnamed_only: bool = True,
+        rename: bool = True,
+        concurrency: int = 1,
+        progress_cb=None,
+    ) -> list[dict]:
+        """Name many functions + their variables, ONE LLM call each.
+
+        Args:
+            limit:        max functions to process
+            unnamed_only: only process sub_* functions
+            rename:       persist names to the .i64
+            concurrency:  how many functions to name in parallel (clamped 1..4).
+                          Only speeds things up if llama-server has multiple slots
+                          (--parallel N); IDA calls still serialize on one worker.
+            progress_cb:  optional async callable(done, total, result), invoked in
+                          completion order with a monotonic done counter.
+
+        Returns one result dict per function (see name_all), in input order.
+        """
+        funcs = await self.list_functions()
+        targets = [f for f in funcs
+                   if not unnamed_only or f["name"].lower().startswith("sub_")]
+        targets = targets[:limit]
+        total = len(targets)
+        results: list[dict] = [None] * total  # type: ignore[list-item]
+
+        conc = max(1, min(4, concurrency))
+        if conc == 1:
+            for i, f in enumerate(targets):
+                r = await self.name_all(f["start"], rename=rename)
+                results[i] = r
+                if progress_cb:
+                    await progress_cb(i + 1, total, r)
+            return results
+
+        sem = asyncio.Semaphore(conc)
+        done = 0
+
+        async def _work(idx: int, f: dict) -> None:
+            nonlocal done
+            async with sem:
+                r = await self.name_all(f["start"], rename=rename)
+            results[idx] = r
+            done += 1
+            if progress_cb:
+                await progress_cb(done, total, r)
+
+        await asyncio.gather(*(_work(i, f) for i, f in enumerate(targets)))
+        return results
+
     # ── binary overview ──────────────────────────────────────────────────────
 
     async def overview(
@@ -239,17 +528,27 @@ class IDADatabase:
         pool = [f for f in pool if f not in pinned]
         sample = pinned + pool[:max(0, sample_size - len(pinned))]
 
-        # build context block
+        # fetch signatures for the sample — a named, typed function tells the model
+        # far more than a bare name (params + return type)
+        sample = sample[:sample_size]
+        try:
+            protos = await self._b.get_protos([f["start"] for f in sample])
+        except Exception:
+            protos = {}
+
+        # build context block — prefer signature, fall back to name
         lines = []
-        for f in sample[:sample_size]:
-            lines.append(f"  {f['name']}  ({f['size']} bytes)")
+        for f in sample:
+            sig = protos.get(hex(f["start"])) or protos.get(f["start"])
+            label = sig or f["name"]
+            lines.append(f"  {label}  ({f['size']} bytes)")
         context = "\n".join(lines)
 
         prompt = (
             f"Here are up to {len(sample)} functions from a binary "
-            f"({len(funcs):,} total functions):\n\n"
+            f"({len(funcs):,} total functions), with signatures where known:\n\n"
             f"{context}\n\n"
-            "Based on these function names and sizes:\n"
+            "Based on these function names, signatures, and sizes:\n"
             "1. What does this binary likely do? (2-3 sentences)\n"
             "2. What are its major subsystems or components?\n"
             "3. Anything security-relevant, unusual, or interesting?\n\n"
@@ -260,29 +559,30 @@ class IDADatabase:
         import httpx
         payload = {
             "model": ollama_model(),
-            "prompt": prompt,
+            "messages": [{"role": "user", "content": prompt}],
             "stream": True,
-            "options": {"temperature": 0.3, "num_predict": 512},
+            "temperature": 0.3,
+            "max_tokens": 2048,
         }
 
         async def _token_stream() -> AsyncIterator[str]:
             async with httpx.AsyncClient(timeout=120) as client:
                 async with client.stream(
-                    "POST", f"{ollama_url()}/api/generate", json=payload
+                    "POST", f"{ollama_url()}/v1/chat/completions", json=payload
                 ) as resp:
                     async for line in resp.aiter_lines():
-                        if not line:
+                        if not line or not line.startswith("data: "):
                             continue
+                        data = line[6:]
+                        if data.strip() == "[DONE]":
+                            break
                         try:
-                            chunk = json.loads(line)
+                            chunk = json.loads(data)
                         except json.JSONDecodeError:
                             continue
-                        if chunk.get("error"):
-                            raise RuntimeError(chunk["error"])
-                        if chunk.get("response"):
-                            yield chunk["response"]
-                        if chunk.get("done"):
-                            break
+                        content = (chunk.get("choices") or [{}])[0].get("delta", {}).get("content")
+                        if content:
+                            yield content
 
         if stream:
             return _token_stream()

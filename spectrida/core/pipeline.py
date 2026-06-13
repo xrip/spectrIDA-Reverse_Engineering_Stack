@@ -27,6 +27,7 @@ def _subprocess_env() -> dict[str, str]:
         p = str(Path(ida).resolve())
         env["PATH"] = p + os.pathsep + env.get("PATH", "")
         env["PYTHONPATH"] = p + os.pathsep + env.get("PYTHONPATH", "")
+        env["IDADIR"] = p
     return env
 
 

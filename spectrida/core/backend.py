@@ -27,6 +27,12 @@ class Backend:
     async def xrefs_to(self, addr) -> list[dict]: ...
     async def xrefs_from(self, addr) -> list[dict]: ...
     async def rename(self, addr, name: str) -> bool: ...
+    async def get_lvars(self, addr) -> dict: ...
+    async def get_protos(self, addresses: list) -> dict: ...
+    async def get_func_meta(self, addr) -> dict: ...
+    async def rename_lvars(self, addr, names: dict, ret_type: str = "") -> dict: ...
+    async def name_variables(self, pseudocode: str, lvars: list[dict]) -> dict: ...
+    async def name_function_and_vars(self, pseudocode, lvars, callees, callers, hints=None) -> dict: ...
     def stream_name(self, addr, insns, callees, callers) -> AsyncIterator[str]: ...
     async def close(self) -> None: ...
 
@@ -52,6 +58,17 @@ class RealBackend(Backend):
     async def xrefs_to(self, addr):  return await _ida.xrefs_to(self._ida, addr)
     async def xrefs_from(self, addr): return await _ida.xrefs_from(self._ida, addr)
     async def rename(self, addr, name): return await _ida.rename(self._ida, addr, name)
+    async def get_lvars(self, addr):   return await _ida.get_lvars(self._ida, addr)
+    async def get_protos(self, addresses): return await _ida.get_protos(self._ida, addresses)
+    async def get_func_meta(self, addr): return await _ida.get_func_meta(self._ida, addr)
+    async def rename_lvars(self, addr, names, ret_type=""):
+        return await _ida.rename_lvars(self._ida, addr, names, ret_type)
+
+    async def name_variables(self, pseudocode, lvars):
+        return await _ollama.name_variables(pseudocode, lvars)
+
+    async def name_function_and_vars(self, pseudocode, lvars, callees, callers, hints=None):
+        return await _ollama.name_function_and_vars(pseudocode, lvars, callees, callers, hints)
 
     def stream_name(self, addr, insns, callees, callers):
         return _ollama.stream_name(insns, callees, callers)
@@ -81,6 +98,17 @@ class DemoBackend(Backend):
                 f["name"] = name
                 return True
         return True
+
+    async def get_lvars(self, addr):   return _demo.get_lvars(addr)
+    async def get_protos(self, addresses): return _demo.get_protos(addresses)
+    async def get_func_meta(self, addr): return _demo.get_func_meta(addr)
+    async def rename_lvars(self, addr, names, ret_type=""):
+        return _demo.rename_lvars(addr, names, ret_type)
+    async def name_variables(self, pseudocode, lvars):
+        return _demo.name_variables(pseudocode, lvars)
+
+    async def name_function_and_vars(self, pseudocode, lvars, callees, callers, hints=None):
+        return _demo.name_function_and_vars(pseudocode, lvars, callees, callers)
 
     def stream_name(self, addr, insns, callees, callers):
         return _demo.stream_name(addr)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 # A tiny fake il2cpp-ish database. Some functions are named; the sub_* ones are
 # there for you to "name" with the (fake) model during the demo/tutorial.
@@ -46,17 +47,22 @@ _DEFAULT_DISASM = [
     ("0x140000010", "ret"),
 ]
 
-# callee links keyed by function start
+# callee links keyed by function start (proto = signature so the model sees params)
 _XREFS_FROM = {
-    0x1400013A0: [{"address": "0x140001220", "name": "Player$$Respawn"}],
-    0x140001100: [{"address": "0x1400013a0", "name": "sub_1400013A0"}],
-    0x140001000: [{"address": "0x140001100", "name": "Player$$TakeDamage"},
-                  {"address": "0x140001480", "name": "Enemy$$Attack"}],
+    0x1400013A0: [{"address": "0x140001220", "name": "Player$$Respawn",
+                   "proto": "void Player__Respawn(Entity *this)"}],
+    0x140001100: [{"address": "0x1400013a0", "name": "sub_1400013A0", "proto": ""}],
+    0x140001000: [{"address": "0x140001100", "name": "Player$$TakeDamage",
+                   "proto": "void Player__TakeDamage(Entity *this, float amount)"},
+                  {"address": "0x140001480", "name": "Enemy$$Attack",
+                   "proto": "void Enemy__Attack(Entity *this, Entity *target)"}],
 }
 _XREFS_TO = {
-    0x140001220: [{"address": "0x1400013a0", "name": "sub_1400013A0"}],
-    0x1400013A0: [{"address": "0x140001100", "name": "Player$$TakeDamage"}],
-    0x140001100: [{"address": "0x140001000", "name": "GameManager$$Update"}],
+    0x140001220: [{"address": "0x1400013a0", "name": "sub_1400013A0", "proto": ""}],
+    0x1400013A0: [{"address": "0x140001100", "name": "Player$$TakeDamage",
+                   "proto": "void Player__TakeDamage(Entity *this, float amount)"}],
+    0x140001100: [{"address": "0x140001000", "name": "GameManager$$Update",
+                   "proto": "void GameManager__Update(GameManager *this, float dt)"}],
 }
 
 # what the (fake) model "decides" sub_* functions should be called
@@ -94,6 +100,41 @@ def decompile(addr) -> str:
     return "// (demo) no pseudocode for this one — try a sub_ function."
 
 
+# signatures for the named demo functions (sub_* have none)
+_DEMO_PROTOS = {
+    0x140001000: "void GameManager__Update(GameManager *this, float dt)",
+    0x140001100: "void Player__TakeDamage(Entity *this, float amount)",
+    0x140001220: "void Player__Respawn(Entity *this)",
+    0x140001480: "void Enemy__Attack(Entity *this, Entity *target)",
+    0x140001700: "bool Inventory__AddItem(Inventory *this, Item *item)",
+    0x140001900: "int SaveSystem__Serialize(SaveSystem *this, char *buf)",
+    0x140001B40: "int NetworkClient__SendPacket(NetworkClient *this, Packet *pkt)",
+}
+
+
+def get_protos(addresses: list) -> dict:
+    out = {}
+    for x in addresses:
+        ea = _norm(x)
+        out[hex(ea)] = _DEMO_PROTOS.get(ea, "")
+    return out
+
+
+# naming hints per function (strings / constants / api calls) for the demo
+_DEMO_META = {
+    0x1400013A0: {"strings": [], "constants": ["0x0"], "api_calls": []},
+    0x140001820: {"strings": [], "constants": ["0x1000193", "0x811c9dc5"],
+                  "api_calls": []},   # FNV-1a prime + offset basis
+    0x140001D00: {"strings": [], "constants": ["0xedb88320"], "api_calls": []},  # CRC32
+    0x140001B40: {"strings": ["POST /api/telemetry"], "constants": [],
+                  "api_calls": ["send", "htons"]},
+}
+
+
+def get_func_meta(addr) -> dict:
+    return _DEMO_META.get(_norm(addr), {"strings": [], "constants": [], "api_calls": []})
+
+
 def xrefs_from(addr) -> list[dict]:
     return _XREFS_FROM.get(_norm(addr), [])
 
@@ -109,3 +150,87 @@ async def stream_name(addr):
     for chunk in text.split(" "):
         await asyncio.sleep(0.03)
         yield chunk + " "
+
+
+# ── variable naming (demo) ───────────────────────────────────────────────────
+
+# generic pseudocode with a1/v1.. names, keyed by function start
+_DEMO_PSEUDO = (
+    "void __fastcall sub(Entity *a1, float *a2) {\n"
+    "    float v1;\n"
+    "    v1 = a1->field_40 - *a2;\n"
+    "    a1->field_40 = v1;\n"
+    "    if (v1 < 0.0)\n"
+    "        Player__Respawn(a1);\n"
+    "}\n"
+)
+_DEMO_LVARS = [
+    {"name": "a1", "type": "Entity *", "is_arg": True},
+    {"name": "a2", "type": "float *",  "is_arg": True},
+    {"name": "v1", "type": "float",    "is_arg": False},
+]
+# what the (fake) model "decides" each generic var should be called + typed
+_DEMO_VAR_NAMES = {"a1": "entity", "a2": "damage_ptr", "v1": "new_health"}
+_DEMO_VAR_TYPES = {"a1": "Entity *", "a2": "float *", "v1": "float"}
+
+# per-function live state so demo renames stick + re-render
+_demo_var_state: dict[int, dict] = {}
+
+
+def _demo_state(a: int) -> dict:
+    if a not in _demo_var_state:
+        _demo_var_state[a] = {
+            "pseudocode": _DEMO_PSEUDO,
+            "lvars": [dict(lv) for lv in _DEMO_LVARS],
+        }
+    return _demo_var_state[a]
+
+
+def get_lvars(addr) -> dict:
+    st = _demo_state(_norm(addr))
+    return {"pseudocode": st["pseudocode"], "lvars": [dict(lv) for lv in st["lvars"]]}
+
+
+def name_variables(pseudocode: str, lvars: list[dict]) -> dict:
+    return {lv["name"]: {"name": _DEMO_VAR_NAMES[lv["name"]],
+                         "type": _DEMO_VAR_TYPES.get(lv["name"], "")}
+            for lv in lvars if lv["name"] in _DEMO_VAR_NAMES}
+
+
+def name_function_and_vars(pseudocode: str, lvars: list[dict],
+                           callees: list, callers: list) -> dict:
+    """Combined demo response — one 'call' returns name + reason + ret_type + vars."""
+    return {
+        "name": "apply_fall_damage",
+        "reason": "Subtracts a delta from a float health field and respawns when it "
+                  "drops below zero. (demo mode — no real model running.)",
+        "ret_type": "void",
+        "variables": name_variables(pseudocode, lvars),
+    }
+
+
+def rename_lvars(addr, names: dict, ret_type: str = "") -> dict:
+    st = _demo_state(_norm(addr))
+    code = st["pseudocode"]
+    renamed = 0
+    retyped = 0
+    for old, spec in names.items():
+        new = spec.get("name", "") if isinstance(spec, dict) else spec
+        ty  = spec.get("type", "") if isinstance(spec, dict) else ""
+        if new and new != old and new.isidentifier():
+            code = re.sub(rf"\b{re.escape(old)}\b", new, code)
+            for lv in st["lvars"]:
+                if lv["name"] == old:
+                    lv["name"] = new
+                    if ty:
+                        lv["type"] = ty
+            renamed += 1
+        if ty:
+            retyped += 1
+    if ret_type:
+        # reflect the return type in the demo pseudocode's leading 'void'
+        code = re.sub(r"^void\b", ret_type, code, count=1)
+        retyped += 1
+    st["pseudocode"] = code
+    return {"renamed": renamed, "retyped": retyped,
+            "ret_type": ret_type, "pseudocode": code}

@@ -29,13 +29,47 @@ def _root(
 def analyze(
     binary: str = typer.Argument(..., help="Binary to analyze (DLL/EXE/NSO…)."),
     workers: int = typer.Option(None, "-w", "--workers"),
+    force: bool = typer.Option(False, "-f", "--force",
+        help="Re-analyze without asking, even if a database already exists."),
 ):
     """Run parallel analysis, then open the browser."""
     p = Path(binary).expanduser()
     if not p.exists():
         typer.echo(f"error: not found: {p}", err=True)
         raise typer.Exit(1)
+
     from spectrida.tui.app import SpectrIDAApp
+    from spectrida.core.pipeline import default_i64
+
+    # Guard: a previous analysis (and any manual renaming you did in it) lives in
+    # this .i64. Re-analyzing opens the RAW binary and overwrites it from scratch,
+    # discarding that work — so ask first unless --force.
+    existing = Path(default_i64(str(p.resolve())))
+    if existing.exists() and not force:
+        typer.echo(f"\n  a database already exists:\n    {existing}")
+        typer.echo("  re-analyzing rebuilds it from the raw binary and DISCARDS any "
+                   "names you added there.\n")
+        choice = typer.prompt(
+            "  [O]pen existing  ·  [R]e-analyze (backs up the old one)  ·  [C]ancel",
+            default="O",
+        ).strip().lower()[:1]
+
+        if choice == "o":
+            SpectrIDAApp(i64=str(existing.resolve())).run()
+            return
+        if choice != "r":
+            typer.echo("  cancelled.")
+            raise typer.Exit(0)
+
+        # Re-analyze: back up the old database so the work is never truly lost.
+        import time
+        backup = existing.with_name(f"{existing.stem}.bak-{time.strftime('%Y%m%d-%H%M%S')}.i64")
+        try:
+            existing.replace(backup)
+            typer.echo(f"  backed up old database -> {backup}")
+        except Exception as e:
+            typer.echo(f"  warning: could not back up old database: {e}", err=True)
+
     SpectrIDAApp(binary=str(p.resolve()), workers=workers).run()
 
 

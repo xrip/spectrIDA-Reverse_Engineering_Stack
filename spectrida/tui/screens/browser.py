@@ -21,13 +21,33 @@ from spectrida.tui.widgets.funclist import FuncList
 from spectrida.tui.widgets.statusbar import StatusBar
 
 
+def _xref_label(x: dict) -> str:
+    """Signature if the neighbour function has a known type (shows params), else
+    its name, else its address."""
+    return x.get("proto") or x.get("name") or x.get("address", "")
+
+
+def _var_change(old: str, spec) -> str:
+    """Render one variable rename/retype for the model pane: a1→[cyan]player[/]:[magenta]Player *[/]."""
+    if isinstance(spec, dict):
+        name = spec.get("name", ""); ty = spec.get("type", "")
+    else:
+        name, ty = spec, ""
+    out = f"{old}→[cyan]{name}[/]"
+    if ty:
+        out += f":[magenta]{ty}[/]"
+    return out
+
+
 class BrowserScreen(Screen):
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("n", "name_func", "Name"),
+        Binding("v", "name_vars", "Vars"),
         Binding("r", "rename_func", "Rename"),
         Binding("d", "decompile_func", "Decompile"),
         Binding("c", "chain_func", "Chain"),
         Binding("b", "batch_name", "Batch"),
+        Binding("t", "deep_branch", "Deep"),
         Binding("o", "overview", "Overview"),
         Binding("slash", "focus_search", "Search"),
         Binding("question_mark", "help", "Help"),
@@ -62,7 +82,7 @@ class BrowserScreen(Screen):
                 yield DisasmPane(id="disasm-pane")
                 yield Static("  MODEL", id="model-header")
                 with Vertical(id="model-pane"):
-                    yield Static("Press [b cyan]N[/] to name this function.", id="model-hint")
+                    yield Static("Press [b cyan]N[/] to name this function · [b cyan]V[/] for its variables.", id="model-hint")
                     yield Static("", id="model-spinner")
                     yield Static("", id="model-result")
                     yield Static("", id="model-reason")
@@ -120,9 +140,10 @@ class BrowserScreen(Screen):
             f"  DISASSEMBLY  ▸  [b]{self._cur['name']}[/]  [dim]{addr:#x}[/]")
         self._insns = await self._b.disasm(addr)
         self.query_one(DisasmPane).show_disasm(self._insns)
-        # gather call-chain context for naming
-        self._callees = [x.get("name") or x["address"] for x in await self._b.xrefs_from(addr)]
-        self._callers = [x.get("name") or x["address"] for x in await self._b.xrefs_to(addr)]
+        # gather call-chain context for naming — prefer full signatures (params)
+        # so already-named neighbours give the model real context
+        self._callees = [_xref_label(x) for x in await self._b.xrefs_from(addr)]
+        self._callers = [_xref_label(x) for x in await self._b.xrefs_to(addr)]
 
     # ── decompile toggle ──
     def action_decompile_func(self) -> None:
@@ -155,10 +176,10 @@ class BrowserScreen(Screen):
         self.query_one("#disasm-header", Static).update(f"  CALL CHAIN  ▸  [b]{self._cur['name']}[/]")
         pane.write(Text("  callers (who calls this):", Style(color="#8b5cf6", bold=True)))
         for c in callers or [{"name": "  (none)"}]:
-            pane.write(Text(f"    ← {c.get('name') or c.get('address','')}", Style(color="#fbbf24")))
+            pane.write(Text(f"    ← {_xref_label(c)}", Style(color="#fbbf24")))
         pane.write(Text("  callees (what this calls):", Style(color="#8b5cf6", bold=True)))
         for c in callees or [{"name": "  (none)"}]:
-            pane.write(Text(f"    → {c.get('name') or c.get('address','')}", Style(color="#00d4ff")))
+            pane.write(Text(f"    → {_xref_label(c)}", Style(color="#00d4ff")))
 
     # ── AI naming ──
     def action_name_func(self) -> None:
@@ -208,6 +229,51 @@ class BrowserScreen(Screen):
         finally:
             self._busy = False
 
+    # ── AI variable / parameter naming ──
+    def action_name_vars(self) -> None:
+        if not self._cur:
+            self.notify("select a function first", severity="warning")
+            return
+        if self._busy:
+            self.notify("still working — wait a moment", severity="warning")
+            return
+        self._busy = True
+        self._spawn(self._name_vars())
+
+    async def _name_vars(self) -> None:
+        from spectrida.api import IDADatabase
+        spin = self.query_one("#model-spinner", Static)
+        res  = self.query_one("#model-result", Static)
+        rsn  = self.query_one("#model-reason", Static)
+        self.query_one("#model-hint", Static).update("")
+        res.update("")
+        rsn.update("")
+        spin.update("  ▸ naming variables…")
+        try:
+            db = IDADatabase(self._b)
+            result = await db.name_variables(self._cur["start"], rename=True)
+            spin.update("")
+            mapping = result.get("mapping", {})
+            if not mapping:
+                res.update("  [dim]no variables to name (needs Hex-Rays, or none found).[/]")
+                return
+            n = result.get("renamed", 0)
+            t = result.get("retyped", 0)
+            res.update(f"  [b green]{n}[/] renamed · [b magenta]{t}[/] typed")
+            rsn.update("\n  " + "  ".join(_var_change(k, v) for k, v in mapping.items()))
+            # auto-show the updated pseudocode
+            code = result.get("pseudocode", "")
+            if code:
+                self._decompiled = True
+                self.query_one("#disasm-header", Static).update(
+                    f"  PSEUDOCODE  ▸  [b]{self._cur['name']}[/]")
+                self.query_one(DisasmPane).show_decompile(code)
+        except Exception as e:
+            spin.update("")
+            res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")
+        finally:
+            self._busy = False
+
     # ── rename ──
     def action_rename_func(self) -> None:
         if not self._cur:
@@ -224,9 +290,11 @@ class BrowserScreen(Screen):
     async def _do_rename(self, new_name: str) -> None:
         ok = await self._b.rename(self._cur["start"], new_name)
         if ok:
-            self._cur["name"] = new_name
-            funcs = await self._b.list_functions()
-            self.query_one("#func-list", FuncList).set_functions(funcs)
+            self._cur["name"] = new_name       # same dict FuncList holds → mutates in place
+            self.query_one("#func-list", FuncList).refresh()
+            self._refresh_func_count()
+            self.query_one("#disasm-header", Static).update(
+                f"  DISASSEMBLY  ▸  [b]{new_name}[/]  [dim]{self._cur['start']:#x}[/]")
 
     # ── batch naming ──
     def action_batch_name(self) -> None:
@@ -242,21 +310,119 @@ class BrowserScreen(Screen):
         rsn = self.query_one("#model-reason", Static)
         self.query_one("#model-hint", Static).update("")
         try:
-            for i, f in enumerate(targets, 1):
-                self.query_one("#model-spinner", Static).update(f"  ▸ batch {i}/{len(targets)} — {f['name']}")
-                insns = await self._b.disasm(f["start"])
-                full = "".join([t async for t in self._b.stream_name(f["start"], insns, [], [])])
-                from spectrida.core.ollama import extract_name
-                name = extract_name(full)
+            from spectrida.api import IDADatabase
+            from spectrida.config import batch_concurrency
+            db = IDADatabase(self._b)
+            bar = self.query_one(StatusBar)
+            by_addr = {f["start"]: f for f in fl._all}
+            total = len(targets)
+            conc = batch_concurrency()
+            state = {"done": 0, "vars": 0, "typed": 0}
+            sem = asyncio.Semaphore(conc)
+            tag = f"  ×{conc}" if conc > 1 else ""
+            self.query_one("#model-spinner", Static).update(f"  ▸ batch{tag or ' '}running…")
+            bar.set_progress(0, total, "")
+
+            async def _name_one(f: dict) -> None:
+                async with sem:                       # cap parallel LLM calls
+                    r = await db.name_all(f["start"], rename=True)
+                name = r.get("new_name")
+                tgt = by_addr.get(r["address"], f)
                 if name:
-                    await self._b.rename(f["start"], name)
-                    f["name"] = name
-                res.update(f"  [green]{i}/{len(targets)}[/] named")
+                    tgt["name"] = name                # same dict FuncList holds → mutates in place
+                    fl.refresh()                      # repaint the list immediately
+                    self._refresh_func_count()
+                state["vars"] += r.get("renamed_vars", 0)
+                state["typed"] += r.get("retyped_vars", 0)
+                state["done"] += 1
+                bar.set_progress(state["done"], total, name or tgt["name"])
+                res.update(f"  [green]{state['done']}/{total}[/] named · "
+                           f"[cyan]{state['vars']}[/] vars · [magenta]{state['typed']}[/] typed{tag}")
+
+            await asyncio.gather(*(_name_one(f) for f in targets))
+
             self.query_one("#model-spinner", Static).update("")
             rsn.update(f"\n  {voice.quip('naming_done')}")
-            self.query_one("#func-list", FuncList).set_functions(await self._b.list_functions())
+            fl.refresh()
+            self._refresh_func_count()
+            bar.clear_progress()
+            bar.set_info(f"{self._b.title} · batch done — {state['done']} named, "
+                         f"{state['vars']} vars, {state['typed']} typed")
         finally:
             self._busy = False
+            try:
+                self.query_one(StatusBar).clear_progress()
+            except Exception:
+                pass
+
+    def _refresh_func_count(self) -> None:
+        """Recompute the named/total tally from the live FuncList items."""
+        fl = self.query_one("#func-list", FuncList)
+        funcs = fl._all
+        named = sum(1 for f in funcs if not is_sub(f["name"]))
+        self.query_one("#func-count", Label).update(f"  {len(funcs):,} funcs · {named:,} named")
+
+    # ── deep branch naming (bottom-up call tree from current function) ──
+    def action_deep_branch(self) -> None:
+        if not self._cur:
+            self.notify("select a function first", severity="warning")
+            return
+        if self._busy:
+            self.notify("still working — wait a moment", severity="warning")
+            return
+        self._busy = True
+        self._spawn(self._deep_branch())
+
+    async def _deep_branch(self) -> None:
+        fl = self.query_one("#func-list", FuncList)
+        by_addr = {f["start"]: f for f in fl._all}
+        res = self.query_one("#model-result", Static)
+        rsn = self.query_one("#model-reason", Static)
+        bar = self.query_one(StatusBar)
+        self.query_one("#model-hint", Static).update("")
+        spin = self.query_one("#model-spinner", Static)
+        spin.update("  ▸ mapping call branch…")
+        try:
+            from spectrida.api import IDADatabase
+            db = IDADatabase(self._b)
+            root = self._cur["start"]
+            state = {"vars": 0, "typed": 0}
+
+            async def cb(done: int, total: int, r: dict) -> None:
+                name = r.get("new_name")
+                tgt = by_addr.get(r["address"])
+                if name and tgt:
+                    tgt["name"] = name
+                    fl.refresh()
+                    self._refresh_func_count()
+                state["vars"] += r.get("renamed_vars", 0)
+                state["typed"] += r.get("retyped_vars", 0)
+                bar.set_progress(done, total, name or "")
+                spin.update(f"  ▸ deep {done}/{total} (bottom-up)")
+                res.update(f"  [green]{done}/{total}[/] named · "
+                           f"[cyan]{state['vars']}[/] vars · [magenta]{state['typed']}[/] typed")
+
+            results = await db.name_branch(root, rename=True, progress_cb=cb)
+            spin.update("")
+            if not results:
+                res.update("  [dim]nothing to name in this branch (all named already).[/]")
+            else:
+                rsn.update(f"\n  branch done — {len(results)} functions, "
+                           f"{state['vars']} vars, {state['typed']} typed  ·  {voice.quip('naming_done')}")
+            fl.refresh()
+            self._refresh_func_count()
+            bar.clear_progress()
+            bar.set_info(f"{self._b.title} · deep branch — {len(results)} named, "
+                         f"{state['vars']} vars, {state['typed']} typed")
+        except Exception as e:
+            spin.update("")
+            res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")
+        finally:
+            self._busy = False
+            try:
+                self.query_one(StatusBar).clear_progress()
+            except Exception:
+                pass
 
     async def _do_overview(self) -> None:
         from spectrida.api import IDADatabase
@@ -282,4 +448,4 @@ class BrowserScreen(Screen):
         self.query_one("#model-spinner", Static).update("")
         self.query_one("#model-result", Static).update("")
         self.query_one("#model-reason", Static).update("")
-        self.query_one("#model-hint", Static).update("Press [b cyan]N[/] to name this function.")
+        self.query_one("#model-hint", Static).update("Press [b cyan]N[/] to name this function · [b cyan]V[/] for its variables.")
