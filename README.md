@@ -129,6 +129,8 @@ spectrida onboard
 | Key | Action |
 |-----|--------|
 | `N` | Name selected function — AI streams the result live |
+| `V` | Name + type all variables/params in the selected function |
+| `T` | Deep branch — bottom-up batch naming of the full call tree |
 | `R` | Rename — pre-filled with the AI suggestion |
 | `D` | Toggle decompiled pseudocode (Hex-Rays) |
 | `C` | Call chain — callers and callees |

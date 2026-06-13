@@ -9,7 +9,7 @@ description = "Ghost through binaries — parallel IDA analysis + AI function na
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "ggfuchsi-oss" }]
+authors = [{ name = "xrip" }]
 keywords = ["ida", "ida-pro", "reverse-engineering", "binary-analysis", "llm", "ai", "tui", "decompiler"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -39,9 +39,9 @@ dev = ["pytest>=8", "ruff>=0.6"]
 spectrida = "spectrida.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/ggfuchsi-oss/spectrIDA"
-Repository = "https://github.com/ggfuchsi-oss/spectrIDA"
-Issues = "https://github.com/ggfuchsi-oss/spectrIDA/issues"
+Homepage = "https://github.com/xrip/spectrIDA-Reverse_Engineering_Stack"
+Repository = "https://github.com/xrip/spectrIDA-Reverse_Engineering_Stack"
+Issues = "https://github.com/xrip/spectrIDA-Reverse_Engineering_Stack/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["spectrida"]
