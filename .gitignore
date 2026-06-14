@@ -23,6 +23,7 @@ venv/
 
 # spectrIDA runtime output
 output/
+*.spectrida-namecache.json
 
 # env / secrets
 .env

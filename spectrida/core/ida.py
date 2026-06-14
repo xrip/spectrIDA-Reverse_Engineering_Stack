@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 from spectrida.config import idalib_dir
@@ -74,6 +75,68 @@ def _parse_type(type_str):
             pass
     return None
 
+# ── type validation / verification ───────────────────────────────────────────
+# Mirror of spectrida.core.types (the worker can't import it — idalib-only path).
+# Keep these sets in sync with that canonical, unit-tested module.
+import re as _re_t
+_BUILTIN_TYPES = {
+    "void","bool","_bool","char","short","int","long","float","double",
+    "wchar_t","size_t","ssize_t","ptrdiff_t","intptr_t","uintptr_t",
+    "__int8","__int16","__int32","__int64","__int128",
+    "int8_t","int16_t","int32_t","int64_t","uint8_t","uint16_t","uint32_t","uint64_t",
+    "_byte","_word","_dword","_qword","_oword","_unknown",
+    "byte","word","dword","qword","uchar","ushort","uint","ulong",
+}
+_TYPE_KEYWORDS = {
+    "const","volatile","struct","union","enum","signed","unsigned","register",
+    "static","restrict","__restrict","__unaligned","near","far","__ptr32","__ptr64",
+    "__cdecl","__stdcall","__fastcall","__thiscall","__usercall",
+}
+
+def _type_idents(type_str):
+    out = []
+    for tok in _re_t.findall(r"[A-Za-z_][A-Za-z0-9_]*", type_str or ""):
+        low = tok.lower()
+        if low in _TYPE_KEYWORDS or low in _BUILTIN_TYPES:
+            continue
+        if tok not in out:
+            out.append(tok)
+    return out
+
+def _type_exists(ident):
+    # True if a named struct/union/enum/typedef `ident` is in the type library.
+    import ida_typeinf
+    try:
+        til = ida_typeinf.get_idati()
+        t = ida_typeinf.tinfo_t()
+        if t.get_named_type(til, ident):
+            return True
+        return ida_typeinf.get_named_type(til, ident, ida_typeinf.NTF_TYPE) is not None
+    except Exception:
+        return True  # be permissive when we genuinely can't check
+
+def _classify_type(type_str):
+    # → (tinfo|None, reason). reason ∈ {"", "empty", "unknown_type:<id>", "parse_failed"}
+    s = (type_str or "").strip().rstrip(";").strip()
+    if not s:
+        return (None, "empty")
+    for ident in _type_idents(s):
+        if not _type_exists(ident):
+            return (None, "unknown_type:%s" % ident)
+    tif = _parse_type(s)
+    if tif is None:
+        return (None, "parse_failed")
+    return (tif, "")
+
+def _norm_ty(s):
+    return _re_t.sub(r"\s+", "", s or "")
+
+def _ty_match(applied, intended):
+    if _norm_ty(applied) == _norm_ty(intended):
+        return True
+    return (sorted(_type_idents(applied)) == sorted(_type_idents(intended))
+            and (applied or "").count("*") == (intended or "").count("*"))
+
 def _set_lvar_type(func_ea, var_name, tif):
     # set an lvar's TYPE (distinct from rename). Requires the var to already have
     # user-info — callers rename first so the saved entry exists under var_name.
@@ -92,10 +155,22 @@ def _set_lvar_type(func_ea, var_name, tif):
 
 def _set_func_proto(func_ea, ret_type, arg_specs):
     # set the FUNCTION prototype: return type + per-arg name/type, preserving the
-    # detected calling convention. arg_specs = {param_index: {"name":.., "type":..}}.
-    # Returns dict counting what stuck: {"ret":0/1, "arg_types":N, "arg_names":M}.
+    # detected calling convention. arg_specs = {param_index: {"name","type","old"}}.
+    # Returns {"ret":0/1, "arg_types":N, "arg_names":M, "dropped":[{var,type,reason}]}
+    # — counts reflect only types VERIFIED via read-back after apply_tinfo.
     import ida_typeinf, idaapi
-    done = {"ret": 0, "arg_types": 0, "arg_names": 0}
+    done = {"ret": 0, "arg_types": 0, "arg_names": 0, "dropped": []}
+
+    def _drop(idx, ty, reason):
+        if idx == "ret":
+            var = "<return>"
+        else:
+            sp = arg_specs.get(idx, {})
+            # post-rename name (the arg keeps its new name even if the type was
+            # rejected) so a corrective re-apply can match it; fall back to old.
+            var = sp.get("name") or sp.get("old") or ("arg%s" % idx)
+        done["dropped"].append({"var": var, "type": ty, "reason": reason})
+
     tif = ida_typeinf.tinfo_t()
     if not (idaapi.get_tinfo(tif, func_ea) and tif.is_func()):
         g = ida_typeinf.tinfo_t()
@@ -107,27 +182,65 @@ def _set_func_proto(func_ea, ret_type, arg_specs):
             tif = g
     fi = ida_typeinf.func_type_data_t()
     if not tif.get_func_details(fi):
+        if ret_type:
+            _drop("ret", ret_type, "no_func_details")
+        for idx, spec in arg_specs.items():
+            if spec.get("type"):
+                _drop(idx, spec["type"], "no_func_details")
         return done
+
     changed = False
+    intended = {}  # idx (or "ret") -> intended type string, for read-back verify
     if ret_type:
-        rt = _parse_type(ret_type)
+        rt, reason = _classify_type(ret_type)
         if rt is not None:
-            fi.rettype = rt; done["ret"] = 1; changed = True
+            fi.rettype = rt; intended["ret"] = ret_type; changed = True
+        else:
+            _drop("ret", ret_type, reason)
     n = fi.size()
     for idx, spec in arg_specs.items():
-        if idx < 0 or idx >= n:
-            continue
         ty = spec.get("type"); nm = spec.get("name")
+        if idx < 0 or idx >= n:
+            if ty:
+                _drop(idx, ty, "arg_index_oob")
+            continue
         if ty:
-            at = _parse_type(ty)
+            at, reason = _classify_type(ty)
             if at is not None:
-                fi[idx].type = at; done["arg_types"] += 1; changed = True
+                fi[idx].type = at; intended[idx] = ty; changed = True
+            else:
+                _drop(idx, ty, reason)
         if nm and nm.isidentifier():
             fi[idx].name = nm; done["arg_names"] += 1; changed = True
-    if changed:
-        nt = ida_typeinf.tinfo_t()
-        if not (nt.create_func(fi) and ida_typeinf.apply_tinfo(func_ea, nt, ida_typeinf.TINFO_DEFINITE)):
-            return {"ret": 0, "arg_types": 0, "arg_names": 0}
+
+    if not changed:
+        return done
+
+    nt = ida_typeinf.tinfo_t()
+    if not (nt.create_func(fi) and ida_typeinf.apply_tinfo(func_ea, nt, ida_typeinf.TINFO_DEFINITE)):
+        # whole apply failed → every intended type is dropped
+        for idx, ty in intended.items():
+            _drop(idx, ty, "apply_failed")
+        return {"ret": 0, "arg_types": 0, "arg_names": 0, "dropped": done["dropped"]}
+
+    # read back and verify each intended type actually stuck
+    v = ida_typeinf.tinfo_t(); fi2 = ida_typeinf.func_type_data_t()
+    if idaapi.get_tinfo(v, func_ea) and v.is_func() and v.get_func_details(fi2):
+        for idx, ty in intended.items():
+            if idx == "ret":
+                if _ty_match(str(fi2.rettype), ty):
+                    done["ret"] = 1
+                else:
+                    _drop("ret", ty, "verify_mismatch")
+            elif idx < fi2.size() and _ty_match(str(fi2[idx].type), ty):
+                done["arg_types"] += 1
+            else:
+                _drop(idx, ty, "verify_mismatch")
+    else:
+        # couldn't read back — trust the successful apply
+        if "ret" in intended:
+            done["ret"] = 1
+        done["arg_types"] += sum(1 for k in intended if k != "ret")
     return done
 
 emit({"ok": True, "result": "ready"})
@@ -189,7 +302,7 @@ for line in sys.stdin:
                 import ida_hexrays
                 addr = _norm(a["address"]); mapping = a.get("names", {}); ret_type = a.get("ret_type", "")
                 cf = idaapi.decompile(addr)
-                renamed = 0; retyped = 0
+                renamed = 0; retyped = 0; dropped = []
                 if cf:
                     func_ea = cf.entry_ea
                     # normalize legacy flat form → {old: {"name","type"}}
@@ -221,7 +334,7 @@ for line in sys.stdin:
                             spec = norm.get(lv.name)
                             if spec:
                                 new = spec["name"]; ty = spec["type"]
-                                arg_specs[arg_idx] = {"name": new, "type": ty}
+                                arg_specs[arg_idx] = {"name": new, "type": ty, "old": lv.name}
                                 if new and new != lv.name and new.isidentifier():
                                     arg_renames += 1
                             arg_idx += 1
@@ -235,19 +348,26 @@ for line in sys.stdin:
                                 if ida_hexrays.rename_lvar(func_ea, lv.name, new):
                                     renamed += 1; cur = new
                             if ty:
-                                tif = _parse_type(ty)
-                                if tif is not None and _set_lvar_type(func_ea, cur, tif):
+                                tif, reason = _classify_type(ty)
+                                if tif is None:
+                                    dropped.append({"var": cur, "type": ty, "reason": reason})
+                                elif _set_lvar_type(func_ea, cur, tif):
                                     retyped += 1
+                                else:
+                                    dropped.append({"var": cur, "type": ty, "reason": "apply_failed"})
                     # function prototype: return type + arg names/types
                     pd = _set_func_proto(func_ea, ret_type, arg_specs)
                     renamed += min(arg_renames, pd["arg_names"])
                     retyped += pd["ret"] + pd["arg_types"]
+                    dropped.extend(pd.get("dropped", []))
                     cf2 = idaapi.decompile(addr)
                     emit({"ok": True, "result": {"renamed": renamed, "retyped": retyped,
                                                  "ret_type": ret_type if pd["ret"] else "",
+                                                 "dropped": dropped,
                                                  "pseudocode": str(cf2) if cf2 else ""}})
                 else:
-                    emit({"ok": True, "result": {"renamed": 0, "retyped": 0, "ret_type": "", "pseudocode": ""}})
+                    emit({"ok": True, "result": {"renamed": 0, "retyped": 0, "ret_type": "",
+                                                 "dropped": [], "pseudocode": ""}})
             except Exception as e:
                 emit({"ok": False, "error": "rename_lvars: %s" % e})
         elif cmd == "protos":
@@ -665,9 +785,11 @@ def _idalib_env() -> dict[str, str]:
 
 
 class IDAHandle:
-    def __init__(self, proc: asyncio.subprocess.Process, i64: str) -> None:
+    def __init__(self, proc: asyncio.subprocess.Process, i64: str,
+                 script_path: str | None = None) -> None:
         self._proc = proc
         self.i64 = i64
+        self._script_path = script_path   # temp worker .py to clean up on close
         self._lock = asyncio.Lock()
 
     async def _readresp(self) -> dict:
@@ -727,6 +849,13 @@ class IDAHandle:
                 await asyncio.wait_for(reader.read(), timeout=1)
             except Exception:
                 pass
+        # remove the temp worker script
+        if self._script_path:
+            try:
+                os.unlink(self._script_path)
+            except Exception:
+                pass
+            self._script_path = None
 
 
 _STREAM_LIMIT = 128 * 1024 * 1024  # 128 MB — list of 150k funcs is ~12 MB as JSON
@@ -736,13 +865,27 @@ async def open_ida(i64_path: str) -> IDAHandle:
     ida = idalib_dir()
     if not ida:
         raise RuntimeError("idalib not configured - run: spectrida onboard")
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-c", _WORKER, str(Path(ida).resolve()), i64_path,
-        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE, env=_idalib_env(),
-        limit=_STREAM_LIMIT,
-    )
-    handle = IDAHandle(proc, i64_path)
+    # Run the worker from a temp .py file rather than `python -c <src>`: the
+    # inline form puts the whole script on the command line, which on Windows
+    # blows past the ~32 KB limit (WinError 206). argv stays [script, ida, i64],
+    # so the worker's argv[1]/argv[2] indexing is unchanged.
+    fd, script_path = tempfile.mkstemp(suffix=".py", prefix="spectrida_worker_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(_WORKER)
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, script_path, str(Path(ida).resolve()), i64_path,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, env=_idalib_env(),
+            limit=_STREAM_LIMIT,
+        )
+    except BaseException:
+        try:
+            os.unlink(script_path)
+        except Exception:
+            pass
+        raise
+    handle = IDAHandle(proc, i64_path, script_path=script_path)
     ready = await handle._readresp()   # waits for the "ready" @@RESP
     if not ready.get("ok"):
         detail = ready.get("result") or ready.get("error") or "unknown error"
@@ -865,7 +1008,7 @@ async def rename_lvars(ida: IDAHandle, address: str | int, names: dict,
             await ida.call("save")
         return result
     except Exception:
-        return {"renamed": 0, "retyped": 0, "ret_type": "", "pseudocode": ""}
+        return {"renamed": 0, "retyped": 0, "ret_type": "", "dropped": [], "pseudocode": ""}
 
 
 def _hex(address: str | int) -> str:

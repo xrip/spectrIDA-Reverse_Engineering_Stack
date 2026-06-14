@@ -22,7 +22,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TypedDict
 
+from spectrida.config import name_cache_enabled, type_retry_enabled
+from spectrida.core import namecache
 from spectrida.core.backend import DemoBackend, RealBackend
+from spectrida.core.glossary import Glossary
+from spectrida.core.namecache import NameCache
 from spectrida.core.llamacpp import (
     extract_name,
     llamacpp_stream_text,
@@ -81,6 +85,19 @@ def _fmt_xref(x: dict) -> str:
     return x.get("proto") or x.get("name") or x.get("address", "")
 
 
+def _addr_int(x: dict) -> int | None:
+    """Parse an xref entry's ``address`` (hex string or int) to int, or None."""
+    a = x.get("address")
+    if isinstance(a, int):
+        return a
+    if isinstance(a, str):
+        try:
+            return int(a, 16)
+        except ValueError:
+            return None
+    return None
+
+
 def _has_pseudocode(pseudocode: str) -> bool:
     """True only if the decompiler produced real pseudocode.
 
@@ -101,6 +118,29 @@ class IDADatabase:
     def __init__(self, backend: RealBackend | DemoBackend) -> None:
         self._b = backend
         self._funcs: list[FunctionInfo] | None = None
+        self._glossary = Glossary()
+        self._glossary_seeded = False
+        self._cache = NameCache(enabled=name_cache_enabled())
+        self._cache_loaded = False
+
+    async def _ensure_cache_loaded(self) -> None:
+        """Load the on-disk naming cache (next to the .i64) once."""
+        if self._cache_loaded:
+            return
+        self._cache_loaded = True
+        i64 = getattr(self._b, "i64", None)
+        if i64 and self._cache.enabled:
+            self._cache.load(str(i64) + ".spectrida-namecache.json")
+
+    async def _ensure_glossary_seed(self) -> None:
+        """Seed the project glossary from already-named functions, once."""
+        if self._glossary_seeded:
+            return
+        self._glossary_seeded = True
+        try:
+            self._glossary.add_existing(await self.list_functions())
+        except Exception:
+            pass
 
     # ── core queries ────────────────────────────────────────────────────────
 
@@ -325,6 +365,7 @@ class IDADatabase:
         where *source* is "pseudocode", "disasm", or "pseudocode+disasm".
         """
         a = address if isinstance(address, int) else int(address, 16)
+        await self._ensure_glossary_seed()
         funcs = await self.list_functions()
         func = next((f for f in funcs if f["start"] == a), None)
         old_name = func["name"] if func else hex(a)
@@ -350,13 +391,28 @@ class IDADatabase:
 
         # Preferred path: staged conversation over the decompiler pseudocode.
         if _has_pseudocode(pseudocode):
-            staged = await self._b.name_function_staged(
-                pseudocode, lvars, callees, callers, hints, llm_history)
-            new_name  = staged.get("name", "")
-            reasoning = staged.get("reason", "")
-            ret_type  = staged.get("ret_type", "")
-            variables = staged.get("variables", {})
-            source = "pseudocode"
+            await self._ensure_cache_loaded()
+            ck = namecache.key(pseudocode, callees, callers, hints)
+            cached = self._cache.get(ck)
+            if cached is not None:
+                # identical function seen before → reuse name/types verbatim
+                new_name  = cached.get("name", "")
+                ret_type  = cached.get("ret_type", "")
+                variables = dict(cached.get("variables", {}))
+                reasoning = "(cached)"
+                source = "cache"
+            else:
+                staged = await self._b.name_function_staged(
+                    pseudocode, lvars, callees, callers, hints, llm_history,
+                    glossary=self._glossary.render())
+                new_name  = staged.get("name", "")
+                reasoning = staged.get("reason", "")
+                ret_type  = staged.get("ret_type", "")
+                variables = staged.get("variables", {})
+                self._cache.put(ck, {"name": new_name, "ret_type": ret_type,
+                                     "variables": variables})
+                self._cache.maybe_save()
+                source = "pseudocode"
 
         # Fallback path: DISASM. Triggers when there's no decompiler at all, or the
         # staged pass produced no name. Variables can't be named without a
@@ -374,15 +430,48 @@ class IDADatabase:
         renamed_vars = 0
         retyped_vars = 0
         applied_ret = ""
+        dropped: list[dict] = []
+        applied_name = ""
         if rename:
             if new_name and rename_function:
-                await self.rename(a, new_name)
+                res_rn = await self.rename(a, new_name)
+                applied_name = res_rn if isinstance(res_rn, str) and res_rn else new_name
             if variables or ret_type:
                 r = await self._b.rename_lvars(a, variables, ret_type=ret_type)
                 renamed_vars = r.get("renamed", 0)
                 retyped_vars = r.get("retyped", 0)
                 applied_ret = r.get("ret_type", "")
+                dropped = r.get("dropped", []) or []
                 pseudocode = r.get("pseudocode", pseudocode)
+
+                # E-2: one corrective retry for types rejected as unknown_type —
+                # ask the model for a replacement from existing/primitive types.
+                if dropped and type_retry_enabled():
+                    unknown = [d for d in dropped
+                               if str(d.get("reason", "")).startswith("unknown_type")]
+                    if unknown:
+                        failed = [{"var": d["var"], "type": d["type"]} for d in unknown]
+                        corrected = await self._b.correct_types(pseudocode, failed)
+                        fix_map = {v: {"name": "", "type": t}
+                                   for v, t in corrected.items()
+                                   if v != "<return>" and t}
+                        fix_ret = corrected.get("<return>", "")
+                        if fix_map or fix_ret:
+                            r2 = await self._b.rename_lvars(a, fix_map, ret_type=fix_ret)
+                            retyped_vars += r2.get("retyped", 0)
+                            if fix_ret and r2.get("ret_type"):
+                                applied_ret = applied_ret or fix_ret
+                            pseudocode = r2.get("pseudocode", pseudocode)
+                            # drop only the vars actually fixed this pass
+                            attempted = set(fix_map) | ({"<return>"} if fix_ret else set())
+                            still = {d["var"] for d in (r2.get("dropped") or [])}
+                            fixed = attempted - still
+                            dropped = [d for d in dropped if d["var"] not in fixed]
+
+        # grow the project glossary with the actually-assigned name (newly named
+        # functions only — revisited named funcs are already seeded)
+        if applied_name:
+            self._glossary.add_name(a, applied_name)
 
         return {
             "address": a, "old_name": old_name, "new_name": new_name,
@@ -390,6 +479,7 @@ class IDADatabase:
             "reasoning": reasoning, "variables": variables,
             "ret_type": applied_ret or ret_type,
             "renamed_vars": renamed_vars, "retyped_vars": retyped_vars,
+            "dropped": dropped,
             "pseudocode": pseudocode,
         }
 
@@ -400,9 +490,12 @@ class IDADatabase:
         max_depth: int = 3,
         max_funcs: int = 60,
         unnamed_only: bool = True,
+        revisit_named: bool = False,
         rename: bool = True,
         progress_cb=None,
         plan_cb=None,
+        _shared_visited: set[int] | None = None,
+        _callees_map: dict[int, list[int]] | None = None,
     ) -> list[dict]:
         """Deep-analyse a whole call branch, BOTTOM-UP.
 
@@ -412,11 +505,20 @@ class IDADatabase:
 
         Args:
             max_depth:    how deep to follow callees from the root
-            max_funcs:    safety cap on total functions visited
+            max_funcs:    safety cap on functions visited *from this root*
             unnamed_only: only name sub_* functions (still traverses through named
                           ones to reach unnamed descendants)
+            revisit_named: also RE-ENTER functions that already have a real name and
+                          apply variable / return typing to them (like the 'V'
+                          action) WITHOUT renaming the function. Overrides
+                          unnamed_only — every visited function becomes a target.
             rename:       persist names to the .i64
             progress_cb:  optional async callable(done, total, result)
+            _shared_visited: internal — a visited-set shared across multiple
+                          name_branch calls (used by batch_name_branches) so each
+                          function is walked / named exactly once across branches.
+            _callees_map: internal — prebuilt {addr: [callee_addr, …]} adjacency so
+                          the DFS doesn't re-query xrefs_from per function.
 
         Returns one result dict per named function (see name_all), leaves first.
         Runs sequentially by design — each step feeds the next.
@@ -426,27 +528,34 @@ class IDADatabase:
         by_addr = {f["start"]: f for f in funcs}
 
         order: list[int] = []          # post-order: leaves first, root last
-        visited: set[int] = set()
+        visited: set[int] = _shared_visited if _shared_visited is not None else set()
+        start_count = len(visited)     # cap max_funcs on *new* visits this call
 
         async def _dfs(addr: int, depth: int) -> None:
-            if addr in visited or len(visited) >= max_funcs:
+            if addr in visited or (len(visited) - start_count) >= max_funcs:
                 return
             visited.add(addr)
             if depth < max_depth:
-                for x in await self.xrefs_from(addr):
-                    try:
-                        ca = int(x["address"], 16) if isinstance(x.get("address"), str) else int(x["address"])
-                    except (KeyError, ValueError, TypeError):
-                        continue
+                if _callees_map is not None:
+                    neighbours = _callees_map.get(addr, [])
+                else:
+                    neighbours = [ca for x in await self.xrefs_from(addr)
+                                  if (ca := _addr_int(x)) is not None]
+                for ca in neighbours:
                     if ca in by_addr:
                         await _dfs(ca, depth + 1)
             order.append(addr)
 
         await _dfs(root, 0)
 
-        targets = [ad for ad in order
-                   if ad in by_addr and (not unnamed_only
-                                         or by_addr[ad]["name"].lower().startswith("sub_"))]
+        def _is_named(ad: int) -> bool:
+            return not by_addr[ad]["name"].lower().startswith("sub_")
+
+        if revisit_named:
+            targets = [ad for ad in order if ad in by_addr]
+        else:
+            targets = [ad for ad in order
+                       if ad in by_addr and (not unnamed_only or not _is_named(ad))]
 
         if plan_cb:
             plan_info = [
@@ -458,7 +567,11 @@ class IDADatabase:
         results: list[dict] = []
         branch_history: list[dict] = []
         for i, ad in enumerate(targets):
-            r = await self.name_all(ad, rename=rename, llm_history=branch_history)
+            # Already-named functions are re-entered for variable / return typing
+            # (like the interactive 'V' action) but NOT renamed; sub_* get full naming.
+            rename_function = not _is_named(ad)
+            r = await self.name_all(ad, rename=rename, rename_function=rename_function,
+                                    llm_history=branch_history)
             results.append(r)
             if progress_cb:
                 await progress_cb(i + 1, len(targets), r)
@@ -517,6 +630,109 @@ class IDADatabase:
 
         await asyncio.gather(*(_work(i, f) for i, f in enumerate(targets)))
         return results
+
+    async def batch_name_branches(
+        self,
+        *,
+        scope: str = "all",
+        rename: bool = True,
+        revisit_named: bool = True,
+        max_depth: int = 64,
+        max_funcs_per_branch: int = 100_000,
+        branch_cb=None,
+        plan_cb=None,
+        progress_cb=None,
+    ) -> dict:
+        """Deep-name the binary bottom-up, branch by branch.
+
+        Builds the call graph once, then runs deep bottom-up naming
+        (:meth:`name_branch`) on a set of branch roots in turn — so within each
+        branch the deepest functions are named first. A shared visited-set dedups
+        overlap between branches, so each function is processed at most once.
+
+        Args:
+            scope: which branches to cover.
+                "all"     — start from the top-level roots (functions nothing
+                            else calls), then sweep any leftover (cycles / below
+                            the depth cap) until the WHOLE binary is covered.
+                "unnamed" — start from every sub_* function ("find unnamed
+                            branches"); only branches that contain unnamed
+                            functions are walked, the rest of the binary is left
+                            untouched. No full-coverage leftover sweep.
+            revisit_named: when True, functions that already have a real name are
+                            still entered and get their variables / return type
+                            applied (like the interactive 'V' action) without
+                            being renamed. For scope="unnamed" pass False to focus
+                            purely on naming the sub_* functions.
+
+        Callbacks:
+            branch_cb:   async (branch_idx, root_name, root_addr) — a new branch begins
+            plan_cb:     forwarded to name_branch — per-branch tree plan
+            progress_cb: forwarded to name_branch — per-function progress
+
+        Returns {"branches", "functions", "named", "vars", "typed"}.
+        """
+        funcs = await self.list_functions()
+        by_addr = {f["start"]: f for f in funcs}
+
+        def _is_sub(ad: int) -> bool:
+            return by_addr[ad]["name"].lower().startswith("sub_")
+
+        # ── build the callee graph once (one xrefs_from per function) ──
+        callees: dict[int, list[int]] = {}
+        indeg: dict[int, int] = {a: 0 for a in by_addr}
+        for a in by_addr:
+            cs = [ca for x in await self.xrefs_from(a)
+                  if (ca := _addr_int(x)) is not None and ca in by_addr and ca != a]
+            callees[a] = cs
+        for cs in callees.values():
+            for c in set(cs):
+                indeg[c] = indeg.get(c, 0) + 1
+
+        if scope == "unnamed":
+            # every sub_* function is a branch root — guarantees each gets named,
+            # bottom-up within its own callee subtree.
+            roots = sorted(a for a in by_addr if _is_sub(a))
+            full_coverage = False
+        else:
+            # roots = nothing calls them; lowest address first for determinism
+            roots = sorted(a for a in by_addr if indeg.get(a, 0) == 0)
+            full_coverage = True
+
+        shared: set[int] = set()
+        totals = {"branches": 0, "functions": 0, "named": 0, "vars": 0,
+                  "typed": 0, "dropped": 0}
+
+        async def _run_branch(start: int) -> None:
+            totals["branches"] += 1
+            if branch_cb:
+                await branch_cb(totals["branches"], by_addr[start]["name"], start)
+            res = await self.name_branch(
+                start, max_depth=max_depth, max_funcs=max_funcs_per_branch,
+                revisit_named=revisit_named, rename=rename,
+                progress_cb=progress_cb, plan_cb=plan_cb,
+                _shared_visited=shared, _callees_map=callees,
+            )
+            for r in res:
+                totals["functions"] += 1
+                if r.get("new_name") and r.get("old_name", "").lower().startswith("sub_"):
+                    totals["named"] += 1
+                totals["vars"]  += r.get("renamed_vars", 0)
+                totals["typed"] += r.get("retyped_vars", 0)
+                totals["dropped"] += len(r.get("dropped") or [])
+
+        for r in roots:
+            if r not in shared:
+                await _run_branch(r)
+
+        # safety net (scope="all" only): cover cycles / functions below the cap
+        if full_coverage:
+            remaining = [a for a in sorted(by_addr) if a not in shared]
+            while remaining:
+                await _run_branch(remaining[0])
+                remaining = [a for a in sorted(by_addr) if a not in shared]
+
+        return totals
 
     # ── binary overview ──────────────────────────────────────────────────────
 
@@ -654,6 +870,10 @@ class IDADatabase:
         return out
 
     async def close(self) -> None:
+        try:
+            self._cache.save()
+        except Exception:
+            pass
         await self._b.close()
 
 

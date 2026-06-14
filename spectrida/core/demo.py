@@ -207,7 +207,8 @@ def name_variables(pseudocode: str, lvars: list[dict]) -> dict:
 
 
 def name_function_staged(pseudocode: str, lvars: list[dict],
-                         callees: list, callers: list, history=None) -> dict:
+                         callees: list, callers: list, history=None,
+                         glossary: str = "") -> dict:
     """Staged demo response — the fake model 'concludes' name + reason + ret_type + vars."""
     return {
         "name": "apply_fall_damage",
@@ -218,11 +219,33 @@ def name_function_staged(pseudocode: str, lvars: list[dict],
     }
 
 
+_DEMO_TYPE_RE = re.compile(r"^[A-Za-z_][\w \*\[\]]*$")
+# the demo's pretend "type library" — named types it recognises
+_DEMO_KNOWN_TYPES = {"Entity", "Player", "CGump"}
+
+
+def _demo_classify_type(ty: str) -> str:
+    """Mirror the worker: '' if applicable, else a drop reason."""
+    from spectrida.core.types import extract_type_identifiers
+    if not _DEMO_TYPE_RE.match(ty):
+        return "parse_failed"
+    for ident in extract_type_identifiers(ty):
+        if ident not in _DEMO_KNOWN_TYPES:
+            return "unknown_type:%s" % ident
+    return ""
+
+
+def correct_types(pseudocode: str, failed: list[dict]) -> dict:
+    """Demo: replace every unknown type with a primitive so the retry resolves."""
+    return {f["var"]: "int" for f in failed if f.get("var")}
+
+
 def rename_lvars(addr, names: dict, ret_type: str = "") -> dict:
     st = _demo_state(_norm(addr))
     code = st["pseudocode"]
     renamed = 0
     retyped = 0
+    dropped: list[dict] = []
     for old, spec in names.items():
         new = spec.get("name", "") if isinstance(spec, dict) else spec
         ty  = spec.get("type", "") if isinstance(spec, dict) else ""
@@ -235,11 +258,16 @@ def rename_lvars(addr, names: dict, ret_type: str = "") -> dict:
                         lv["type"] = ty
             renamed += 1
         if ty:
-            retyped += 1
+            # mimic the worker: unapplicable types are reported, not silently lost
+            reason = _demo_classify_type(ty)
+            if reason:
+                dropped.append({"var": new or old, "type": ty, "reason": reason})
+            else:
+                retyped += 1
     if ret_type:
         # reflect the return type in the demo pseudocode's leading 'void'
         code = re.sub(r"^void\b", ret_type, code, count=1)
         retyped += 1
     st["pseudocode"] = code
     return {"renamed": renamed, "retyped": retyped,
-            "ret_type": ret_type, "pseudocode": code}
+            "ret_type": ret_type, "dropped": dropped, "pseudocode": code}

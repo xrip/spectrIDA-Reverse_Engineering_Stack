@@ -368,11 +368,16 @@ def _build_stream_prompt(insns: list[dict], callees: list[str], callers: list[st
 def _single_stage_prompt(pseudocode: str, lvars: list[dict],
                           callees: list[str], callers: list[str],
                           hints: dict | None,
-                          insns: list[dict] | None = None) -> str:
+                          insns: list[dict] | None = None,
+                          glossary: str = "") -> str:
     """Single-turn prompt that requests ALL naming outputs in one JSON reply.
 
     Using actual variable names in the schema (a1, v3, …) lets the model map
     its answer directly to the IDA lvar names without any guessing.
+
+    *glossary* (optional) is a project-wide vocabulary / already-assigned-names
+    block prepended so the model keeps naming consistent across the binary. It
+    rides in the user turn so the cached system prefix is untouched.
     """
     args    = [lv for lv in lvars if lv.get("is_arg")]
     locals_ = [lv for lv in lvars if not lv.get("is_arg")]
@@ -394,7 +399,8 @@ def _single_stage_prompt(pseudocode: str, lvars: list[dict],
     schema += "}"
 
     return (
-        f"{_ctx_block('Calls', callees)}"
+        (f"{glossary}\n\n" if glossary else "")
+        + f"{_ctx_block('Calls', callees)}"
         f"{_ctx_block('Called by', callers)}"
         f"{_hints_block(hints)}"
         + (f"Parameters: {_lvar_list(args)}\n" if args else "")
@@ -471,6 +477,45 @@ def _filter_var_map(raw: dict, lvars: list[dict]) -> dict[str, dict]:
         # are not silently dropped.
         if isinstance(nm, str) and nm.isidentifier() and (nm != k or ty):
             out[k] = {"name": nm, "type": ty if isinstance(ty, str) else ""}
+    return out
+
+
+async def correct_types(pseudocode: str, failed: list[dict]) -> dict[str, str]:
+    """Ask the model to REPLACE types that were rejected as unknown.
+
+    *failed* = [{"var", "type"}] — variables whose proposed type named a
+    struct/enum/typedef absent from this binary's type library. The model picks a
+    replacement that's either a primitive or an existing type (the binary context
+    already lists the available structs/enums). Returns {var: new_type_str}.
+    Use "<return>" as a var name for the function return type.
+    """
+    if not failed:
+        return {}
+    lines = "\n".join(f'  - {f.get("var", "")}: rejected "{f.get("type", "")}"'
+                      for f in failed)
+    user_msg = (
+        "Some types you proposed could not be applied because the named type does "
+        "NOT exist in this binary's type library:\n"
+        f"{lines}\n\n"
+        "For each variable choose a REPLACEMENT type that is either a primitive C "
+        "type (e.g. int, unsigned int, void *, char *, uint8_t *, size_t) or an "
+        "EXISTING struct/enum/typedef from this binary (see the type list above). "
+        "Do not invent new type names.\n"
+        'Reply ONLY with JSON mapping name→type: {"buf": "uint8_t *", ...}. '
+        "Omit any variable you are unsure about.\n\n"
+        f"Pseudocode:\n{pseudocode[:5000]}\n\nJSON:"
+    )
+    raw = await _stream_chat([
+        {"role": "system", "content": _build_system()},
+        {"role": "user",   "content": user_msg},
+    ], json_mode=llm_json_mode())
+    obj = extract_json_object(raw)
+    out: dict[str, str] = {}
+    for k, v in obj.items():
+        if isinstance(v, dict):
+            v = v.get("type", "")
+        if isinstance(v, str) and v.strip():
+            out[str(k)] = v.strip()
     return out
 
 
@@ -579,6 +624,7 @@ async def name_function_staged(
     hints: dict | None = None,
     history: list[dict] | None = None,
     insns: list[dict] | None = None,
+    glossary: str = "",
 ) -> dict:
     """Name + type a function in a SINGLE LLM call.
 
@@ -591,6 +637,10 @@ async def name_function_staged(
     conversation across multiple functions in a call branch so each caller sees
     the callee names it just resolved — maximising KV-cache prefix reuse for
     the deep-branch naming flow.
+
+    *glossary* (project vocabulary + assigned names) is injected ONLY on the
+    first user turn of a fresh conversation — within a branch the accumulated
+    history already carries the resolved names, so we avoid repeating it.
     """
     # Fast path: trivial thunks need no LLM round-trip
     fast = _fast_name(insns, hints)
@@ -601,12 +651,14 @@ async def name_function_staged(
     locals_ = [lv for lv in lvars if not lv.get("is_arg")]
 
     messages = history if history is not None else []
+    fresh = not messages
     if not messages:
         messages.append({"role": "system", "content": _build_system()})
 
     messages.append({
         "role":    "user",
-        "content": _single_stage_prompt(pseudocode, lvars, callees, callers, hints, insns),
+        "content": _single_stage_prompt(pseudocode, lvars, callees, callers, hints, insns,
+                                        glossary=glossary if fresh else ""),
     })
     raw = await _stream_chat(messages, json_mode=llm_json_mode())
     obj = extract_json_object(raw)

@@ -186,6 +186,27 @@ def llm_json_mode() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def type_retry_enabled() -> bool:
+    """One corrective LLM retry for types dropped as unknown_type (default OFF).
+
+    When a proposed type names a struct/enum that isn't in the binary's type
+    library, ask the model once for a replacement from existing/primitive types.
+    Enable with SPECTRIDA_TYPE_RETRY=1 (or [pipeline] type_retry = true).
+    """
+    raw = get("pipeline", "type_retry", "SPECTRIDA_TYPE_RETRY").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def name_cache_enabled() -> bool:
+    """Cache naming results by normalized function content (default on).
+
+    Gives identical functions identical names and makes re-runs cheap/stable.
+    Disable with SPECTRIDA_NAME_CACHE=0 (or [pipeline] name_cache = false).
+    """
+    raw = get("pipeline", "name_cache", "SPECTRIDA_NAME_CACHE").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def batch_concurrency() -> int:
     """How many AI naming requests to run in parallel during batch (1 = sequential).
 

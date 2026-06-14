@@ -30,7 +30,14 @@ FuncList { height: 1fr; background: #0b0d16; }
 DisasmPane { height: 1fr; background: #0b0d16; padding: 0 1; }
 
 #model-header { height: 1; background: #0f1117; color: #8b5cf6; text-style: bold; padding: 0 1; }
-#model-pane { height: 45%; background: #080a10; padding: 0 1; }
+#model-pane {
+    height: 45%; background: #080a10; padding: 0 1;
+    overflow-y: auto; overflow-x: hidden;
+    scrollbar-size-vertical: 1;
+    scrollbar-color: #1f2430; scrollbar-color-hover: #8b5cf6;
+    scrollbar-color-active: #8b5cf6; scrollbar-background: #080a10;
+}
+#model-pane:focus { background: #0a0d14; }
 #model-hint { color: #475569; }
 #model-result { color: #22c55e; text-style: bold; }
 #model-reason { color: #6b7280; }

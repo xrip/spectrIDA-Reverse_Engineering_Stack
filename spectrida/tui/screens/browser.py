@@ -10,7 +10,7 @@ from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Input, Label, Static
 
@@ -41,6 +41,18 @@ def _var_change(old: str, spec) -> str:
 
 
 _ARG_RE = re.compile(r"^(a\d+|this|arg\d*)$", re.IGNORECASE)
+
+
+def _fmt_dropped(dropped: list[dict]) -> str:
+    """Render dropped (unapplied) types for the reason pane: var:type (reason)."""
+    if not dropped:
+        return ""
+    bits = []
+    for d in dropped[:8]:
+        bits.append(f"[red]{d.get('var','?')}[/]:[magenta]{d.get('type','')}[/] "
+                    f"[dim]({d.get('reason','')})[/]")
+    more = f"  [dim]+{len(dropped) - 8} more[/]" if len(dropped) > 8 else ""
+    return "  ⚠ dropped: " + "  ".join(bits) + more
 
 
 def _render_deep_tree(
@@ -134,9 +146,12 @@ class BrowserScreen(Screen):
         Binding("r", "rename_func", "Rename"),
         Binding("d", "decompile_func", "Decompile"),
         Binding("c", "chain_func", "Chain"),
-        Binding("b", "batch_name", "Batch"),
+        Binding("b", "batch_name", "Batch-all"),
+        Binding("u", "unnamed_branches", "Unnamed"),
         Binding("t", "deep_branch", "Deep"),
         Binding("o", "overview", "Overview"),
+        Binding("bracketright", "scroll_report_down", "Report▼", show=False),
+        Binding("bracketleft", "scroll_report_up", "Report▲", show=False),
         Binding("slash", "focus_search", "Search"),
         Binding("i", "lumina_info", "Lumina"),
         Binding("question_mark", "help", "Help"),
@@ -170,7 +185,7 @@ class BrowserScreen(Screen):
                 yield Static("  DISASSEMBLY", id="disasm-header")
                 yield DisasmPane(id="disasm-pane")
                 yield Static("  MODEL", id="model-header")
-                with Vertical(id="model-pane"):
+                with VerticalScroll(id="model-pane"):
                     yield Static("Press [b cyan]N[/] to name this function · [b cyan]V[/] for its variables.", id="model-hint")
                     yield Static("", id="model-spinner")
                     yield Static("", id="model-result")
@@ -357,12 +372,17 @@ class BrowserScreen(Screen):
             n = result.get("renamed_vars", 0)
             t = result.get("retyped_vars", 0)
             ret = result.get("ret_type", "")
+            dropped = result.get("dropped", [])
             if not mapping and not ret:
                 res.update("  [dim]no variables to name (needs Hex-Rays, or none found).[/]")
                 return
             ret_part = f" · ret [b magenta]{ret}[/]" if ret else ""
-            res.update(f"  [b green]{n}[/] renamed · [b magenta]{t}[/] typed{ret_part}")
-            rsn.update("\n  " + "  ".join(_var_change(k, v) for k, v in mapping.items()))
+            drop_part = f" · [b red]{len(dropped)}[/] dropped" if dropped else ""
+            res.update(f"  [b green]{n}[/] renamed · [b magenta]{t}[/] typed{ret_part}{drop_part}")
+            reason_lines = "\n  " + "  ".join(_var_change(k, v) for k, v in mapping.items())
+            if dropped:
+                reason_lines += "\n" + _fmt_dropped(dropped)
+            rsn.update(reason_lines)
             # auto-show the updated pseudocode
             code = result.get("pseudocode", "")
             if code:
@@ -406,58 +426,152 @@ class BrowserScreen(Screen):
         self._spawn(self._batch())
 
     async def _batch(self) -> None:
+        """Whole-binary sweep: deep-name every call branch bottom-up (leaves→roots).
+        Already-named functions are re-entered for variable / return typing."""
+        await self._run_sweep(
+            scope="all", revisit_named=True,
+            mapping_msg="  ▸ mapping whole binary…", label="whole binary")
+
+    async def _run_sweep(self, *, scope: str, revisit_named: bool,
+                         mapping_msg: str, label: str) -> None:
+        """Drive batch_name_branches over the deep-branch tree UI (reset per branch).
+
+        Shared by the whole-binary batch ('B') and find-unnamed-branches ('U')."""
         self._busy = True
         fl = self.query_one("#func-list", FuncList)
-        targets = [f for f in fl._items if is_sub(f["name"])][:25]
+        by_addr = {f["start"]: f for f in fl._all}
         res = self.query_one("#model-result", Static)
         rsn = self.query_one("#model-reason", Static)
+        bar = self.query_one(StatusBar)
+        spin = self.query_one("#model-spinner", Static)
         self.query_one("#model-hint", Static).update("")
+        spin.update(mapping_msg)
         try:
             from spectrida.api import IDADatabase
-            from spectrida.config import batch_concurrency
             db = IDADatabase(self._b)
-            bar = self.query_one(StatusBar)
-            by_addr = {f["start"]: f for f in fl._all}
-            total = len(targets)
-            conc = batch_concurrency()
-            state = {"done": 0, "named": 0, "vars": 0, "typed": 0}
-            sem = asyncio.Semaphore(conc)
-            tag = f"  ×{conc}" if conc > 1 else ""
-            self.query_one("#model-spinner", Static).update(f"  ▸ batch{tag or ' '}running…")
-            bar.set_progress(0, total, "")
+            state = {"named": 0, "skipped": 0, "vars": 0, "typed": 0, "dropped": 0}
+            tree: list[dict] = []
+            cur_idx = [0]
+            branch_label = [""]   # spinner prefix, updated per branch
 
-            async def _name_one(f: dict) -> None:
-                async with sem:                       # cap parallel LLM calls
-                    r = await db.name_all(f["start"], rename=True)
-                name = r.get("new_name")
-                tgt = by_addr.get(r["address"], f)
-                if name:
-                    state["named"] += 1
-                    tgt["name"] = name                # same dict FuncList holds → mutates in place
-                    fl.refresh()                      # repaint the list immediately
-                    self._refresh_func_count()
-                state["vars"] += r.get("renamed_vars", 0)
-                state["typed"] += r.get("retyped_vars", 0)
-                state["done"] += 1
-                bar.set_progress(state["done"], total, name or "(no name)")
-                res.update(f"  [green]{state['named']}/{state['done']}[/] named · "
-                           f"[cyan]{state['vars']}[/] vars · [magenta]{state['typed']}[/] typed{tag}")
+            plan_cb, cb = self._make_deep_callbacks(
+                fl=fl, by_addr=by_addr, state=state, tree=tree,
+                cur_idx=cur_idx, label=branch_label)
 
-            await asyncio.gather(*(_name_one(f) for f in targets))
+            async def branch_cb(idx: int, root_name: str, root_addr: int) -> None:
+                branch_label[0] = f"branch {idx} · {root_name[:20]} · "
 
-            self.query_one("#model-spinner", Static).update("")
-            rsn.update(f"\n  {voice.quip('naming_done')}")
+            totals = await db.batch_name_branches(
+                scope=scope, rename=True, revisit_named=revisit_named,
+                branch_cb=branch_cb, plan_cb=plan_cb, progress_cb=cb)
+
+            spin.update("")
+            if not totals["functions"]:
+                rsn.update("")
+                res.update(f"  [dim]nothing to do — no {label} branches found.[/]")
+            else:
+                drop = f", {totals['dropped']} dropped" if totals.get("dropped") else ""
+                summary = (f"{label} — {totals['branches']} branches, "
+                           f"{totals['named']} named, {totals['vars']} vars, "
+                           f"{totals['typed']} typed{drop}  ·  {voice.quip('naming_done')}")
+                rsn.update(_render_deep_tree(tree, len(tree), len(tree), summary=summary))
             fl.refresh()
             self._refresh_func_count()
             bar.clear_progress()
-            bar.set_info(f"{self._b.title} · batch done — {state['named']}/{state['done']} named, "
-                         f"{state['vars']} vars, {state['typed']} typed")
+            drop = f", {totals['dropped']} dropped" if totals.get("dropped") else ""
+            bar.set_info(f"{self._b.title} · {label} — {totals['named']} named, "
+                         f"{totals['vars']} vars, {totals['typed']} typed{drop}")
+        except Exception as e:
+            spin.update("")
+            res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")
         finally:
             self._busy = False
             try:
                 self.query_one(StatusBar).clear_progress()
             except Exception:
                 pass
+
+    # ── find unnamed branches (deep-name every sub_* branch) ──
+    def action_unnamed_branches(self) -> None:
+        if self._busy:
+            self.notify("still working — wait a moment", severity="warning")
+            return
+        self._spawn(self._unnamed_branches())
+
+    async def _unnamed_branches(self) -> None:
+        """Find every sub_* function's branch and deep-name it (bottom-up)."""
+        await self._run_sweep(
+            scope="unnamed", revisit_named=False,
+            mapping_msg="  ▸ finding unnamed branches…", label="unnamed branches")
+
+    def _make_deep_callbacks(self, *, fl, by_addr, state, tree, cur_idx, label):
+        """Build (plan_cb, progress_cb) that drive the deep-branch tree widget.
+
+        Shared by the single-branch deep-name ('T') and the whole-binary batch
+        ('B'). *tree* is reset per branch via plan_cb; *state* accumulates
+        named/vars/typed across however many branches run; *label[0]* is a spinner
+        prefix (e.g. "branch 3 · root · ") set by the caller's branch_cb.
+        """
+        res  = self.query_one("#model-result", Static)
+        rsn  = self.query_one("#model-reason", Static)
+        bar  = self.query_one(StatusBar)
+        spin = self.query_one("#model-spinner", Static)
+
+        async def plan_cb(targets_info: list[tuple[int, str]]) -> None:
+            tree[:] = [
+                {
+                    "addr": addr, "old_name": name, "new_name": "",
+                    "status": "running" if i == 0 else "pending",
+                    "N": None, "P": None, "T": None, "V": None,
+                }
+                for i, (addr, name) in enumerate(targets_info)
+            ]
+            cur_idx[0] = 0
+            spin.update(f"  ▸ {label[0]}deep 0/{len(tree)}")
+            rsn.update(_render_deep_tree(tree, 0, 0))
+
+        async def cb(done: int, total: int, r: dict) -> None:
+            idx = done - 1
+            if 0 <= idx < len(tree):
+                item = tree[idx]
+                item["status"] = "done"
+                item["new_name"] = r.get("new_name") or ""
+                variables = r.get("variables") or {}
+                args = {k: v for k, v in variables.items() if _ARG_RE.match(k)}
+                locs = {k: v for k, v in variables.items() if k not in args}
+                item["N"] = bool(r.get("new_name"))
+                item["P"] = bool(args)
+                item["T"] = bool(r.get("ret_type")) or r.get("retyped_vars", 0) > 0
+                item["V"] = bool(locs) or r.get("renamed_vars", 0) > 0
+
+            cur_idx[0] = done
+            if done < len(tree):
+                tree[done]["status"] = "running"
+
+            name = r.get("new_name")
+            # only sub_* functions are actually renamed; revisited named funcs keep
+            # their name (we just applied variable / return typing to them)
+            renamed = name and r.get("old_name", "").lower().startswith("sub_")
+            tgt = by_addr.get(r["address"])
+            if renamed:
+                state["named"] += 1
+                if tgt:
+                    tgt["name"] = name
+                    fl.refresh()
+                    self._refresh_func_count()
+            elif not name:
+                state["skipped"] += 1
+            state["vars"]  += r.get("renamed_vars", 0)
+            state["typed"] += r.get("retyped_vars", 0)
+            state["dropped"] = state.get("dropped", 0) + len(r.get("dropped") or [])
+            bar.set_progress(done, total, name or "(no name)")
+            spin.update(f"  ▸ {label[0]}deep {done}/{total}")
+            drop_part = f" · [red]{state['dropped']}[/] dropped" if state.get("dropped") else ""
+            res.update(f"  [green]{state['named']}[/] named · "
+                       f"[cyan]{state['vars']}[/] vars · [magenta]{state['typed']}[/] typed{drop_part}")
+            rsn.update(_render_deep_tree(tree, cur_idx[0], done))
+
+        return plan_cb, cb
 
     def _refresh_func_count(self) -> None:
         """Recompute the named/total tally from the live FuncList items."""
@@ -490,71 +604,26 @@ class BrowserScreen(Screen):
             from spectrida.api import IDADatabase
             db = IDADatabase(self._b)
             root = self._cur["start"]
-            state = {"named": 0, "skipped": 0, "vars": 0, "typed": 0}
+            state = {"named": 0, "skipped": 0, "vars": 0, "typed": 0, "dropped": 0}
 
             # Tree state: list of per-function dicts, populated by plan_cb before naming starts.
             tree: list[dict] = []
             cur_idx = [0]  # mutable ref so closures can update it
+            label = [""]
+            plan_cb, cb = self._make_deep_callbacks(
+                fl=fl, by_addr=by_addr, state=state, tree=tree, cur_idx=cur_idx, label=label)
 
-            async def plan_cb(targets_info: list[tuple[int, str]]) -> None:
-                tree[:] = [
-                    {
-                        "addr": addr, "old_name": name, "new_name": "",
-                        "status": "running" if i == 0 else "pending",
-                        "N": None, "P": None, "T": None, "V": None,
-                    }
-                    for i, (addr, name) in enumerate(targets_info)
-                ]
-                spin.update(f"  ▸ deep 0/{len(tree)} (bottom-up)")
-                rsn.update(_render_deep_tree(tree, 0, 0))
-
-            async def cb(done: int, total: int, r: dict) -> None:
-                idx = done - 1
-                if 0 <= idx < len(tree):
-                    item = tree[idx]
-                    item["status"] = "done"
-                    item["new_name"] = r.get("new_name") or ""
-
-                    variables = r.get("variables") or {}
-                    args = {k: v for k, v in variables.items() if _ARG_RE.match(k)}
-                    locs = {k: v for k, v in variables.items() if k not in args}
-
-                    item["N"] = bool(r.get("new_name"))
-                    item["P"] = bool(args)
-                    item["T"] = bool(r.get("ret_type")) or r.get("retyped_vars", 0) > 0
-                    item["V"] = bool(locs) or r.get("renamed_vars", 0) > 0
-
-                cur_idx[0] = done
-                if done < len(tree):
-                    tree[done]["status"] = "running"
-
-                name = r.get("new_name")
-                tgt = by_addr.get(r["address"])
-                if name:
-                    state["named"] += 1
-                    if tgt:
-                        tgt["name"] = name
-                        fl.refresh()
-                        self._refresh_func_count()
-                else:
-                    state["skipped"] += 1
-                state["vars"] += r.get("renamed_vars", 0)
-                state["typed"] += r.get("retyped_vars", 0)
-                bar.set_progress(done, total, name or "(no name)")
-                spin.update(f"  ▸ deep {done}/{total} (bottom-up)")
-                res.update(f"  [green]{state['named']}[/] named · "
-                           f"[cyan]{state['vars']}[/] vars · [magenta]{state['typed']}[/] typed")
-                rsn.update(_render_deep_tree(tree, cur_idx[0], done))
-
-            results = await db.name_branch(root, rename=True, progress_cb=cb, plan_cb=plan_cb)
+            results = await db.name_branch(
+                root, rename=True, revisit_named=True, progress_cb=cb, plan_cb=plan_cb)
             spin.update("")
             if not results:
                 rsn.update("")
                 res.update("  [dim]nothing to name in this branch (all named already).[/]")
             else:
                 skip = f", {state['skipped']} skipped" if state["skipped"] else ""
+                drop = f", {state['dropped']} dropped" if state.get("dropped") else ""
                 summary = (f"branch done — {state['named']}/{len(results)} named{skip}, "
-                           f"{state['vars']} vars, {state['typed']} typed"
+                           f"{state['vars']} vars, {state['typed']} typed{drop}"
                            f"  ·  {voice.quip('naming_done')}")
                 rsn.update(_render_deep_tree(tree, len(tree), len(tree), summary=summary))
             fl.refresh()
@@ -591,6 +660,19 @@ class BrowserScreen(Screen):
 
     def action_overview(self) -> None:
         self._spawn(self._do_overview())
+
+    # ── scroll the report pane (also scrollable by mouse wheel) ──
+    def action_scroll_report_down(self) -> None:
+        try:
+            self.query_one("#model-pane", VerticalScroll).scroll_page_down(animate=False)
+        except Exception:
+            pass
+
+    def action_scroll_report_up(self) -> None:
+        try:
+            self.query_one("#model-pane", VerticalScroll).scroll_page_up(animate=False)
+        except Exception:
+            pass
 
     def action_lumina_info(self) -> None:
         self._spawn(self._show_lumina_info())

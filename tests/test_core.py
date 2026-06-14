@@ -2,9 +2,8 @@ import asyncio
 
 from spectrida.core import llamacpp
 from spectrida.core.llamacpp import (
-    _STAGED_SYSTEM,
-    _SYSTEM,
-    _build_prompt,
+    _RE_SYSTEM,
+    _build_stream_prompt,
     _hints_block,
     extract_json_object,
     extract_name,
@@ -47,15 +46,13 @@ def test_extract_json_ignores_forced_reasoning_preamble():
 
 def test_prompt_uses_text_field():
     # disasm rows are {"address","text"}; the prompt must read 'text'
-    p = _build_prompt([{"address": "0x1", "text": "mov eax, 1"}], ["callee"], ["caller"])
+    p = _build_stream_prompt([{"address": "0x1", "text": "mov eax, 1"}], ["callee"], ["caller"])
     assert "mov eax, 1" in p and "callee" in p and "caller" in p
 
 
-def test_system_prompts_are_not_game_specific():
-    assert "game binaries" not in _SYSTEM.lower()
-    assert "game binaries" not in _STAGED_SYSTEM.lower()
-    assert "native binaries" in _SYSTEM
-    assert "native binaries" in _STAGED_SYSTEM
+def test_system_prompt_is_not_game_specific():
+    assert "game binaries" not in _RE_SYSTEM.lower()
+    assert "native binaries" in _RE_SYSTEM
 
 
 def test_anthropic_payload_splits_system(monkeypatch):
@@ -101,15 +98,16 @@ def test_hints_block_renders_rich_metadata():
     assert "Pointer/field accesses" in text
 
 
-def test_staged_history_is_reused_across_functions(monkeypatch):
+def test_history_is_reused_across_functions(monkeypatch):
+    # single-call naming: one _stream_chat per function, history grows
+    # system + (user + assistant) per function and the next call sees prior names.
     calls = []
     responses = iter([
-        '{"name": "first_func", "reason": "first"}',
-        '{"a1": {"name": "buffer", "type": "uint8_t *"}}',
-        '{"variables": {"v1": {"name": "score", "type": "int"}}, "ret_type": "int"}',
-        '{"name": "second_func", "reason": "second"}',
-        '{"a1": {"name": "entity", "type": "Entity *"}}',
-        '{"variables": {"v1": {"name": "state", "type": "int"}}, "ret_type": "void"}',
+        '{"name": "first_func", "reason": "first", "ret_type": "int", '
+        '"params": {"a1": {"name": "buffer", "type": "uint8_t *"}}, '
+        '"locals": {"v1": {"name": "score", "type": "int"}}}',
+        '{"name": "second_func", "reason": "second", "ret_type": "void", '
+        '"params": {"a1": {"name": "entity", "type": "Entity *"}}}',
     ])
 
     async def fake_stream_chat(messages, **_kwargs):
@@ -130,6 +128,7 @@ def test_staged_history_is_reused_across_functions(monkeypatch):
     asyncio.run(run())
 
     assert history[0]["role"] == "system"
-    assert len(history) == 13
-    assert len(calls[3]) > len(calls[0])
-    assert any("first_func" in m["content"] for m in calls[3])
+    assert len(history) == 5            # system + (user+assistant)*2
+    assert len(calls) == 2
+    assert len(calls[1]) > len(calls[0])
+    assert any("first_func" in m["content"] for m in calls[1])

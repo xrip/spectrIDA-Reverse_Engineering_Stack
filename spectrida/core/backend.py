@@ -32,8 +32,9 @@ class Backend:
     async def get_func_meta(self, addr) -> dict: ...
     async def rename_lvars(self, addr, names: dict, ret_type: str = "") -> dict: ...
     async def name_variables(self, pseudocode: str, lvars: list[dict]) -> dict: ...
+    async def correct_types(self, pseudocode: str, failed: list[dict]) -> dict: ...
     async def name_function_staged(self, pseudocode, lvars, callees, callers,
-                                   hints=None, history=None) -> dict: ...
+                                   hints=None, history=None, glossary="") -> dict: ...
     def stream_name(self, addr, insns, callees, callers) -> AsyncIterator[str]: ...
     async def get_entry_point(self) -> int | None: ...
     async def lumina_probe(self) -> list[str] | None: ...
@@ -91,10 +92,13 @@ class RealBackend(Backend):
     async def name_variables(self, pseudocode, lvars):
         return await _llamacpp.name_variables(pseudocode, lvars)
 
+    async def correct_types(self, pseudocode, failed):
+        return await _llamacpp.correct_types(pseudocode, failed)
+
     async def name_function_staged(self, pseudocode, lvars, callees, callers,
-                                   hints=None, history=None):
+                                   hints=None, history=None, glossary=""):
         return await _llamacpp.name_function_staged(
-            pseudocode, lvars, callees, callers, hints, history)
+            pseudocode, lvars, callees, callers, hints, history, glossary=glossary)
 
     async def stream_name(self, addr, insns, callees, callers):
         # Fetch pseudocode so the streaming preview uses the same rich context
@@ -120,6 +124,7 @@ class RealBackend(Backend):
 class DemoBackend(Backend):
     demo = True
     title = "demo.dll"
+    last_glossary = ""   # last glossary block passed to name_function_staged
 
     def __init__(self) -> None:
         self._funcs = [dict(f) for f in _demo.FUNCTIONS]
@@ -146,9 +151,14 @@ class DemoBackend(Backend):
     async def name_variables(self, pseudocode, lvars):
         return _demo.name_variables(pseudocode, lvars)
 
+    async def correct_types(self, pseudocode, failed):
+        return _demo.correct_types(pseudocode, failed)
+
     async def name_function_staged(self, pseudocode, lvars, callees, callers,
-                                   hints=None, history=None):
-        return _demo.name_function_staged(pseudocode, lvars, callees, callers, history=history)
+                                   hints=None, history=None, glossary=""):
+        self.last_glossary = glossary   # observable for tests / debugging
+        return _demo.name_function_staged(pseudocode, lvars, callees, callers,
+                                          history=history, glossary=glossary)
 
     def stream_name(self, addr, insns, callees, callers):
         return _demo.stream_name(addr)
