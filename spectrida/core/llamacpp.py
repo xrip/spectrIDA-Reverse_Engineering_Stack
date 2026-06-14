@@ -466,7 +466,10 @@ def _filter_var_map(raw: dict, lvars: list[dict]) -> dict[str, dict]:
             ty = v.get("type") or ""
         else:
             nm, ty = v, ""
-        if isinstance(nm, str) and nm.isidentifier() and nm != k:
+        # Include the entry when the name changes OR when a type is provided —
+        # so type-only changes (e.g. keeping the name "this" but setting CGump *)
+        # are not silently dropped.
+        if isinstance(nm, str) and nm.isidentifier() and (nm != k or ty):
             out[k] = {"name": nm, "type": ty if isinstance(ty, str) else ""}
     return out
 
