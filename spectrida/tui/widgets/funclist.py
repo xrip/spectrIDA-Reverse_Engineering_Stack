@@ -51,6 +51,25 @@ class FuncList(Widget, can_focus=True):
     def _height(self) -> int:
         return max(1, self.size.height)
 
+    def _jump(self, idx: int) -> None:
+        """Move cursor to absolute index, centering it in the viewport."""
+        self.cursor = max(0, min(len(self._items) - 1, idx))
+        h = self._height()
+        self.top = max(0, self.cursor - h // 2)
+        self.refresh()
+        self._emit()
+
+    def seek(self, addr: int) -> None:
+        """Move cursor to the function at addr, or the closest by address."""
+        if not self._items:
+            return
+        for i, f in enumerate(self._items):
+            if f["start"] == addr:
+                self._jump(i)
+                return
+        best = min(range(len(self._items)), key=lambda i: abs(self._items[i]["start"] - addr))
+        self._jump(best)
+
     def _move(self, delta: int) -> None:
         if not self._items:
             return

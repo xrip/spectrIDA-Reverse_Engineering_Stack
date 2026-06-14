@@ -28,7 +28,12 @@ rc = idapro.open_database(sys.argv[2], False)
 if rc != 0:
     emit({"ok": False, "result": f"open_database failed rc={rc}"})
     sys.exit(1)
-import idautils, idc, idaapi, ida_funcs
+import idautils, idc, idaapi, ida_funcs, os as _os
+
+# Load Lumina plugin so IDA can use it for auto-naming during the session.
+_lumina_dll = _os.path.join(sys.argv[1], "plugins", "lumina.dll")
+try: idaapi.load_plugin(_lumina_dll)
+except Exception: pass
 
 def _norm(a):
     return int(a, 16) if isinstance(a, str) and a.startswith("0x") else int(a)
@@ -139,7 +144,9 @@ for line in sys.stdin:
             for ea in idautils.Functions():
                 if len(out) >= lim: break
                 fn = idaapi.get_func(ea); sz = fn.size() if fn else 0
-                out.append({"name": idc.get_func_name(ea), "start": ea, "end": ea + sz, "size": sz})
+                _flags = fn.flags if fn else 0
+                out.append({"name": idc.get_func_name(ea), "start": ea, "end": ea + sz, "size": sz,
+                            "lumina": bool(_flags & getattr(idaapi, "FUNC_LUMINA", 0))})
             emit({"ok": True, "result": out})
         elif cmd == "disasm":
             addr = _norm(a["address"]); fn = idaapi.get_func(addr); out = []
@@ -192,6 +199,18 @@ for line in sys.stdin:
                             norm[k] = {"name": v.get("name", "") or "", "type": v.get("type", "") or ""}
                         else:
                             norm[k] = {"name": v or "", "type": ""}
+                    # Deduplicate proposed names within this function: if two
+                    # variables get the same name, the second becomes name_2, etc.
+                    _seen: dict[str, int] = {}
+                    for k in norm:
+                        nm = norm[k]["name"]
+                        if not nm:
+                            continue
+                        if nm in _seen:
+                            _seen[nm] += 1
+                            norm[k]["name"] = f"{nm}_{_seen[nm]}"
+                        else:
+                            _seen[nm] = 1
                     arg_specs = {}; arg_renames = 0
                     for lv in cf.get_lvars():
                         spec = norm.get(lv.name)
@@ -279,6 +298,7 @@ for line in sys.stdin:
                     return "%s!%s" % (seg, label)
                 return label
 
+            typed_call_sites = []
             facts = {}
             if fn:
                 items = list(idautils.FuncItems(fn.start_ea))
@@ -387,6 +407,39 @@ for line in sys.stdin:
                          12)
                 facts["callers"] = callers_count
 
+                # Typed call sites: decompile each unique caller and extract the
+                # pseudocode line that calls our function.  The decompiler shows the
+                # actual argument types/casts as inferred by Hex-Rays, so the LLM
+                # can use them to assign proper struct/enum types to our parameters.
+                # Best-effort: silently skipped when Hex-Rays is unavailable.
+                try:
+                    import ida_hexrays as _hr
+                    try: _hr.init_hexrays_plugin()
+                    except Exception: pass
+                    _fn_nm = idc.get_func_name(fn.start_ea) or ""
+                    _done_callers = set()
+                    for _xr in idautils.XrefsTo(fn.start_ea):
+                        if len(typed_call_sites) >= 5:
+                            break
+                        _cfn = idaapi.get_func(_xr.frm)
+                        if not _cfn or _cfn.start_ea in _done_callers:
+                            continue
+                        _done_callers.add(_cfn.start_ea)
+                        _cnm = idc.get_func_name(_cfn.start_ea) or hex(_cfn.start_ea)
+                        try:
+                            _cf = _hr.decompile(_cfn.start_ea)
+                            if not _cf:
+                                continue
+                            for _ln in str(_cf).splitlines():
+                                _ls = _ln.strip()
+                                if _fn_nm and _fn_nm in _ls and "(" in _ls:
+                                    typed_call_sites.append("%s: %s" % (_cnm, _ls))
+                                    break
+                        except Exception:
+                            continue
+                except (ImportError, AttributeError, Exception):
+                    pass
+
             emit({"ok": True, "result": {
                 "strings": strings,
                 "constants": consts,
@@ -397,10 +450,22 @@ for line in sys.stdin:
                 "caller_return_usage": caller_sites,
                 "globals": globals_,
                 "field_accesses": fields,
+                "typed_call_sites": typed_call_sites,
             }})
         elif cmd == "rename":
-            ok = idc.set_name(_norm(a["address"]), a["name"], idc.SN_NOWARN | idc.SN_NOCHECK)
-            emit({"ok": True, "result": bool(ok)})
+            target_ea = _norm(a["address"])
+            name = a["name"]
+            # Make name globally unique: if already used at a different address,
+            # try name_1, name_2, … so we never silently collide.
+            _ex = idc.get_name_ea_simple(name)
+            if _ex != idc.BADADDR and _ex != target_ea:
+                for _i in range(1, 100):
+                    _c = f"{name}_{_i}"
+                    if idc.get_name_ea_simple(_c) == idc.BADADDR:
+                        name = _c; break
+            ok = idc.set_name(target_ea, name, idc.SN_NOWARN | idc.SN_NOCHECK)
+            # Return the actual name used so callers can update their display.
+            emit({"ok": True, "result": name if ok else False})
         elif cmd == "save":
             idc.save_database(""); emit({"ok": True, "result": True})
         elif cmd == "xrefs_to":   # callers of this function
@@ -423,6 +488,157 @@ for line in sys.stdin:
                                                  "name": idc.get_func_name(tf.start_ea),
                                                  "proto": _proto(tf.start_ea)}
             emit({"ok": True, "result": list(seen.values())})
+        elif cmd == "entry_point":
+            found = None
+            _lflags = idc.get_inf_attr(idc.INF_LFLAGS)
+            _is_dll = bool(_lflags & 0x4)  # LFLG_IS_DLL
+            if _is_dll:
+                # DLL: first named export that isn't DllMain, then any export
+                _exports = [(ea, nm) for _, _, ea, nm in idautils.Entries()
+                            if ea != idc.BADADDR]
+                for ea, nm in _exports:
+                    if nm and nm != "DllMain":
+                        found = ea; break
+                if found is None and _exports:
+                    found = _exports[0][0]
+            else:
+                # EXE: well-known entry names > PE entry table > INF_MAIN > INF_START_EA
+                _ENTRY_NAMES = (
+                    "main", "wmain", "_main", "WinMain", "wWinMain", "DllMain",
+                    "_WinMain@16", "mainCRTStartup", "WinMainCRTStartup",
+                    "wWinMainCRTStartup", "wmainCRTStartup", "start", "_start",
+                )
+                for nm in _ENTRY_NAMES:
+                    ea = idc.get_name_ea_simple(nm)
+                    if ea != idc.BADADDR:
+                        found = ea; break
+                if found is None:
+                    for _, _, ea, nm in idautils.Entries():
+                        if ea != idc.BADADDR:
+                            found = ea; break
+                if found is None:
+                    for attr in (idc.INF_MAIN, idc.INF_START_EA):
+                        try:
+                            ea = idc.get_inf_attr(attr)
+                            if ea and ea != idc.BADADDR:
+                                found = ea; break
+                        except Exception:
+                            pass
+            emit({"ok": True, "result": hex(found) if found is not None else None})
+        elif cmd == "lumina_probe":
+            import os as _os, tempfile as _tf
+            # Load lumina plugin by full path — load_plugin("lumina") resolves
+            # relative to cwd, not the IDA dir, so we must be explicit.
+            _ida_dir = sys.argv[1]  # IDA installation directory
+            _lumina_dll = _os.path.join(_ida_dir, "plugins", "lumina.dll")
+            try: idaapi.load_plugin(_lumina_dll)
+            except Exception: pass
+            # Collect ALL lumina-related symbols from idaapi and idc
+            idaapi_all = sorted(x for x in dir(idaapi) if "lumina" in x.lower())
+            idc_all    = sorted(x for x in dir(idc)    if "lumina" in x.lower())
+            # Separate callables from constants
+            callables  = [x for x in idaapi_all if callable(getattr(idaapi, x, None))]
+            constants  = [x for x in idaapi_all if not callable(getattr(idaapi, x, None))]
+            report = {
+                "idaapi_callables": callables,
+                "idaapi_constants": constants,
+                "idc_lumina": idc_all,
+            }
+            # Write full report to a temp file so nothing is truncated
+            _log = _tf.mktemp(prefix="spectrida_lumina_", suffix=".json")
+            try:
+                import json as _j
+                with open(_log, "w") as _f:
+                    _j.dump(report, _f, indent=2)
+                report["log_file"] = _log
+            except Exception: pass
+            emit({"ok": True, "result": report})
+        elif cmd == "binary_context":
+            info = idaapi.get_inf_structure()
+            bits = "64" if info.is_64bit() else "32"
+            arch = info.procName.strip() or "unknown"
+            ibase = idaapi.get_imagebase()
+            fname = idc.get_input_file_path() or ""
+            import os as _os
+            _lflags = idc.get_inf_attr(idc.INF_LFLAGS)
+            _is_dll = bool(_lflags & 0x4)
+            _kind = "DLL" if _is_dll else "EXE"
+            lines = [
+                f"File: {_os.path.basename(fname)}  |  PE{bits}, {arch}, {_kind}  |  ImageBase: {ibase:#x}",
+            ]
+            # For DLLs: exports are the primary interface — show them first
+            _exports = [(ord_n, ea, nm) for _, ord_n, ea, nm in idautils.Entries()
+                        if ea != idc.BADADDR]
+            if _is_dll and _exports:
+                lines.append("")
+                lines.append("Exports (public API of this DLL):")
+                for ord_n, ea, nm in _exports[:60]:
+                    label = nm if nm else f"ord_{ord_n}"
+                    lines.append(f"  [{ord_n}] {label}")
+                if len(_exports) > 60:
+                    lines.append(f"  ... and {len(_exports)-60} more")
+            # Imports sorted by call frequency
+            lines.append("")
+            lines.append("Imports (sorted by call frequency):")
+            total_dlls = 0
+            qty = idaapi.get_import_module_qty()
+            for i in range(qty):
+                dll = idaapi.get_import_module_name(i) or f"module_{i}"
+                entries = []
+                def _cb(ea, nm, ord_n, _e=entries):
+                    if nm: _e.append((ea, nm))
+                    return True
+                idaapi.enum_import_names(i, _cb)
+                if not entries:
+                    continue
+                counted = sorted(
+                    ((nm, len(list(idautils.XrefsTo(ea)))) for ea, nm in entries),
+                    key=lambda x: -x[1]
+                )[:20]
+                parts = [f"{nm}({n})" if n else nm for nm, n in counted]
+                lines.append(f"  {dll}: {', '.join(parts)}")
+                total_dlls += 1
+                if total_dlls >= 40:
+                    lines.append("  ... (truncated)")
+                    break
+            # For EXEs: exports at the bottom (rare but possible)
+            if not _is_dll:
+                lines.append("")
+                exp_names = [nm for _, _, nm in _exports if nm][:20]
+                lines.append(f"Exports: {', '.join(exp_names)}" if exp_names else "Exports: (none)")
+            emit({"ok": True, "result": "\n".join(lines)})
+        elif cmd == "get_local_types":
+            # Enumerate user-defined structs, unions, and enums from the IDA
+            # local type library.  Names are added to the binary context so the
+            # LLM knows what types exist and can use them when assigning parameter
+            # and variable types.  Compiler-internal names (starting with _ $ tag)
+            # and common Windows handle stubs are filtered out.
+            try:
+                import ida_typeinf as _iti
+                _ti = _iti.get_idati()
+                _total = _iti.get_ordinal_count(_ti)
+                _structs, _enums = [], []
+                _skip_pfx = ("_", "$", "tag", "GUID", "IID", "CLSID",
+                             "HINSTANCE__", "HWND__", "HDC__", "HKEY__")
+                for _i in range(1, min(_total + 1, 3001)):
+                    try:
+                        _nm = _iti.get_numbered_type_name(_ti, _i)
+                        if not _nm or any(_nm.startswith(_p) for _p in _skip_pfx):
+                            continue
+                        _tif = _iti.tinfo_t()
+                        if not _iti.get_numbered_type(_ti, _i, _tif):
+                            continue
+                        if _tif.is_struct() or _tif.is_union():
+                            _structs.append(_nm)
+                        elif _tif.is_enum():
+                            _enums.append(_nm)
+                    except Exception:
+                        continue
+                emit({"ok": True, "result": {
+                    "structs": _structs[:300], "enums": _enums[:150]
+                }})
+            except Exception as _e:
+                emit({"ok": True, "result": {"structs": [], "enums": [], "note": str(_e)}})
         else:
             emit({"ok": False, "error": "unknown cmd %s" % cmd})
     except Exception as e:
@@ -549,12 +765,19 @@ async def decompile(ida: IDAHandle, address: str | int) -> str:
     except Exception:
         return ""
 
-async def rename(ida: IDAHandle, address: str | int, new_name: str) -> bool:
+async def rename(ida: IDAHandle, address: str | int, new_name: str) -> str | bool:
+    """Rename function. Returns the actual name used (may differ if deduped), or False."""
     try:
-        ok = await ida.call("rename", address=_hex(address), name=new_name)
+        result = await ida.call("rename", address=_hex(address), name=new_name)
+        # result is either a bool (old worker) or the actual name string (new worker)
+        if isinstance(result, str):
+            if result:
+                await ida.call("save")
+            return result or False
+        ok = bool(result)
         if ok:
             await ida.call("save")
-        return bool(ok)
+        return ok
     except Exception:
         return False
 
@@ -569,6 +792,30 @@ async def xrefs_from(ida: IDAHandle, address: str | int) -> list[dict]:
         return await ida.call("xrefs_from", address=_hex(address))
     except Exception:
         return []
+
+async def get_entry_point(ida: IDAHandle) -> int | None:
+    """Return the best-guess entry point address (WinMain/main/PE entry), or None."""
+    try:
+        raw = await ida.call("entry_point")
+        return int(raw, 16) if raw else None
+    except Exception:
+        return None
+
+
+async def lumina_probe(ida: IDAHandle) -> list[str] | None:
+    """Return list of public names in ida_lumina, or None if unavailable."""
+    try:
+        return await ida.call("lumina_probe")
+    except Exception:
+        return None
+
+
+async def get_binary_context(ida: IDAHandle) -> str:
+    """Return a static one-line-per-import summary for the KV-cache system prefix."""
+    try:
+        return await ida.call("binary_context") or ""
+    except Exception:
+        return ""
 
 async def get_lvars(ida: IDAHandle, address: str | int) -> dict:
     """Return {"pseudocode": str, "lvars": [{name,type,is_arg}, ...]} (needs Hex-Rays)."""
@@ -590,6 +837,13 @@ async def get_func_meta(ida: IDAHandle, address: str | int) -> dict:
         return await ida.call("func_meta", address=_hex(address))
     except Exception:
         return {"strings": [], "constants": [], "api_calls": []}
+
+async def get_local_types(ida: IDAHandle) -> dict:
+    """Return {"structs": [...], "enums": [...]} — user-defined types from IDA type library."""
+    try:
+        return await ida.call("get_local_types") or {}
+    except Exception:
+        return {}
 
 async def rename_lvars(ida: IDAHandle, address: str | int, names: dict,
                        ret_type: str = "") -> dict:

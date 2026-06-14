@@ -152,6 +152,40 @@ def llamacpp_api_key() -> str:
     return get("llamacpp", "api_key", "SPECTRIDA_LLAMACPP_API_KEY").strip()
 
 
+def llm_timeout() -> float:
+    """HTTP timeout in seconds for a single LLM request.
+
+    Must exceed the longest expected reasoning + generation time.
+    Default 300 s (5 min). Override with SPECTRIDA_LLAMACPP_TIMEOUT or
+    [llamacpp] timeout = 600.
+    """
+    try:
+        return float(
+            get("llamacpp", "timeout", "SPECTRIDA_LLAMACPP_TIMEOUT") or 300
+        )
+    except ValueError:
+        return 300.0
+
+
+def llm_retries() -> int:
+    """How many times to retry a failed LLM request (connection errors, timeouts, 5xx).
+    Default 3. Set SPECTRIDA_LLAMACPP_RETRIES=0 to disable."""
+    try:
+        return max(0, int(get("llamacpp", "retries", "SPECTRIDA_LLAMACPP_RETRIES") or 3))
+    except ValueError:
+        return 3
+
+
+def llm_json_mode() -> bool:
+    """Force JSON output via response_format=json_object.
+
+    Works with llama-server b3805+. Set SPECTRIDA_LLAMACPP_JSON_MODE=0
+    (or [llamacpp] json_mode = false) to disable for older servers.
+    """
+    raw = get("llamacpp", "json_mode", "SPECTRIDA_LLAMACPP_JSON_MODE").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def batch_concurrency() -> int:
     """How many AI naming requests to run in parallel during batch (1 = sequential).
 

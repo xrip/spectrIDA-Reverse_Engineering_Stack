@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import ClassVar
 
 from rich.style import Style
@@ -39,6 +40,93 @@ def _var_change(old: str, spec) -> str:
     return out
 
 
+_ARG_RE = re.compile(r"^(a\d+|this|arg\d*)$", re.IGNORECASE)
+
+
+def _render_deep_tree(
+    items: list[dict],
+    current_idx: int,
+    done_count: int,
+    max_rows: int = 26,
+    summary: str = "",
+) -> str:
+    """Render the deep-branch progress tree as Rich markup for a Static widget.
+
+    Each row shows: indicator · function-name · N P T V checkboxes.
+    N=name renamed, P=params renamed, T=types/ret applied, V=locals renamed.
+    A sliding window keeps the current function visible.
+    """
+    total = len(items)
+    if not total:
+        return ""
+
+    focus = max(0, min(current_idx, total - 1))
+    half = max_rows // 2
+    start = max(0, focus - half + 2)
+    end = min(total, start + max_rows)
+    start = max(0, end - max_rows)
+
+    header = (
+        f"  [bold]deep branch[/] [dim]{done_count}/{total}[/]"
+        "   [dim]N[/]=name  [dim]P[/]=params  [dim]T[/]=types  [dim]V[/]=vars"
+    )
+    lines = [header, ""]
+
+    if start > 0:
+        lines.append(f"  [dim]  ↑ {start} more[/]")
+
+    def _chk(val: bool | None) -> str:
+        if val is None:
+            return "[dim]·[/]"
+        return "[green]✓[/]" if val else "[dim]–[/]"
+
+    for i in range(start, end):
+        item = items[i]
+        status = item["status"]
+        is_cur = (i == current_idx)
+
+        if is_cur:
+            prefix = "[bold yellow]▶[/]"
+        elif status == "done":
+            prefix = "[green]✓[/]" if item.get("N") else "[dim]–[/]"
+        else:
+            prefix = " "
+
+        new_name = item.get("new_name") or ""
+        old_name = item.get("old_name") or hex(item["addr"])
+        display_text = (new_name if (new_name and status == "done") else old_name)[:24]
+        pad = " " * max(0, 25 - len(display_text))
+
+        if new_name and status == "done":
+            name_markup = f"[green]{display_text}[/]"
+        elif is_cur:
+            name_markup = f"[bold]{display_text}[/]"
+        elif status == "pending":
+            name_markup = f"[dim]{display_text}[/]"
+        else:
+            name_markup = f"[dim]{display_text}[/]"
+
+        if status == "pending" and not is_cur:
+            chks = "[dim]· · · ·[/]"
+        else:
+            chks = (
+                f"{_chk(item.get('N'))}[dim]N[/] "
+                f"{_chk(item.get('P'))}[dim]P[/] "
+                f"{_chk(item.get('T'))}[dim]T[/] "
+                f"{_chk(item.get('V'))}[dim]V[/]"
+            )
+
+        lines.append(f"  {prefix} {name_markup}{pad} {chks}")
+
+    if end < total:
+        lines.append(f"  [dim]  ↓ {total - end} more[/]")
+
+    if summary:
+        lines += ["", f"  [dim]{summary}[/]"]
+
+    return "\n".join(lines)
+
+
 class BrowserScreen(Screen):
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("n", "name_func", "Name"),
@@ -50,6 +138,7 @@ class BrowserScreen(Screen):
         Binding("t", "deep_branch", "Deep"),
         Binding("o", "overview", "Overview"),
         Binding("slash", "focus_search", "Search"),
+        Binding("i", "lumina_info", "Lumina"),
         Binding("question_mark", "help", "Help"),
         Binding("q", "app.quit", "Quit"),
     ]
@@ -110,6 +199,12 @@ class BrowserScreen(Screen):
         fl = self.query_one("#func-list", FuncList)
         fl.set_functions(funcs)
         fl.focus()  # focus immediately so keyboard works as soon as list appears
+        try:
+            entry = await self._b.get_entry_point()
+            if entry is not None:
+                fl.seek(entry)
+        except Exception:
+            pass
         named = sum(1 for f in funcs if not is_sub(f["name"]))
         self.query_one("#func-count", Label).update(f"  {len(funcs):,} funcs · {named:,} named")
         self.query_one("#header-status", Static).update(f" ●  {len(funcs):,} funcs")
@@ -295,9 +390,10 @@ class BrowserScreen(Screen):
             self._spawn(self._do_rename(new_name))
 
     async def _do_rename(self, new_name: str) -> None:
-        ok = await self._b.rename(self._cur["start"], new_name)
-        if ok:
-            self._cur["name"] = new_name       # same dict FuncList holds → mutates in place
+        result = await self._b.rename(self._cur["start"], new_name)
+        actual = result if isinstance(result, str) else (new_name if result else "")
+        if actual:
+            self._cur["name"] = actual   # same dict FuncList holds → mutates in place
             self.query_one("#func-list", FuncList).refresh()
             self._refresh_func_count()
             self.query_one("#disasm-header", Static).update(
@@ -396,7 +492,42 @@ class BrowserScreen(Screen):
             root = self._cur["start"]
             state = {"named": 0, "skipped": 0, "vars": 0, "typed": 0}
 
+            # Tree state: list of per-function dicts, populated by plan_cb before naming starts.
+            tree: list[dict] = []
+            cur_idx = [0]  # mutable ref so closures can update it
+
+            async def plan_cb(targets_info: list[tuple[int, str]]) -> None:
+                tree[:] = [
+                    {
+                        "addr": addr, "old_name": name, "new_name": "",
+                        "status": "running" if i == 0 else "pending",
+                        "N": None, "P": None, "T": None, "V": None,
+                    }
+                    for i, (addr, name) in enumerate(targets_info)
+                ]
+                spin.update(f"  ▸ deep 0/{len(tree)} (bottom-up)")
+                rsn.update(_render_deep_tree(tree, 0, 0))
+
             async def cb(done: int, total: int, r: dict) -> None:
+                idx = done - 1
+                if 0 <= idx < len(tree):
+                    item = tree[idx]
+                    item["status"] = "done"
+                    item["new_name"] = r.get("new_name") or ""
+
+                    variables = r.get("variables") or {}
+                    args = {k: v for k, v in variables.items() if _ARG_RE.match(k)}
+                    locs = {k: v for k, v in variables.items() if k not in args}
+
+                    item["N"] = bool(r.get("new_name"))
+                    item["P"] = bool(args)
+                    item["T"] = bool(r.get("ret_type")) or r.get("retyped_vars", 0) > 0
+                    item["V"] = bool(locs) or r.get("renamed_vars", 0) > 0
+
+                cur_idx[0] = done
+                if done < len(tree):
+                    tree[done]["status"] = "running"
+
                 name = r.get("new_name")
                 tgt = by_addr.get(r["address"])
                 if name:
@@ -406,26 +537,28 @@ class BrowserScreen(Screen):
                         fl.refresh()
                         self._refresh_func_count()
                 else:
-                    state["skipped"] += 1          # model produced no usable name
+                    state["skipped"] += 1
                 state["vars"] += r.get("renamed_vars", 0)
                 state["typed"] += r.get("retyped_vars", 0)
                 bar.set_progress(done, total, name or "(no name)")
                 spin.update(f"  ▸ deep {done}/{total} (bottom-up)")
                 res.update(f"  [green]{state['named']}[/] named · "
                            f"[cyan]{state['vars']}[/] vars · [magenta]{state['typed']}[/] typed")
+                rsn.update(_render_deep_tree(tree, cur_idx[0], done))
 
-            results = await db.name_branch(root, rename=True, progress_cb=cb)
+            results = await db.name_branch(root, rename=True, progress_cb=cb, plan_cb=plan_cb)
             spin.update("")
             if not results:
+                rsn.update("")
                 res.update("  [dim]nothing to name in this branch (all named already).[/]")
             else:
                 skip = f", {state['skipped']} skipped" if state["skipped"] else ""
-                rsn.update(f"\n  branch done — {state['named']}/{len(results)} named{skip}, "
-                           f"{state['vars']} vars, {state['typed']} typed  ·  {voice.quip('naming_done')}")
+                summary = (f"branch done — {state['named']}/{len(results)} named{skip}, "
+                           f"{state['vars']} vars, {state['typed']} typed"
+                           f"  ·  {voice.quip('naming_done')}")
+                rsn.update(_render_deep_tree(tree, len(tree), len(tree), summary=summary))
             fl.refresh()
             self._refresh_func_count()
-            # refresh the function we're looking at so its header + body show the new
-            # names of the callees we just resolved (the DB changed under the view)
             if self._cur:
                 self._decompiled = False
                 await self._load_disasm()
@@ -458,6 +591,23 @@ class BrowserScreen(Screen):
 
     def action_overview(self) -> None:
         self._spawn(self._do_overview())
+
+    def action_lumina_info(self) -> None:
+        self._spawn(self._show_lumina_info())
+
+    async def _show_lumina_info(self) -> None:
+        import json as _json
+        members = await self._b.lumina_probe()
+        res = self.query_one("#model-result", Static)
+        self.query_one("#model-spinner", Static).update("")
+        self.query_one("#model-reason", Static).update("")
+        if members is None:
+            res.update("[red]ida_lumina[/] not available")
+        elif isinstance(members, dict):
+            res.update(_json.dumps(members, indent=2, ensure_ascii=False))
+        else:
+            lines = "\n".join(f"  {m}" for m in sorted(members))
+            res.update(f"[bold]ida_lumina[/] ({len(members)} members):\n{lines}")
 
     def action_help(self) -> None:
         self.app.push_screen(HelpScreen())

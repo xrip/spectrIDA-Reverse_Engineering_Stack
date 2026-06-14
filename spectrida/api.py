@@ -126,15 +126,17 @@ class IDADatabase:
         """Functions called by the function at *address*."""
         return await self._b.xrefs_from(address)
 
-    async def rename(self, address: int | str, new_name: str) -> bool:
-        """Rename the function at *address* and persist to the .i64."""
-        ok = await self._b.rename(address, new_name)
-        if ok and self._funcs:
+    async def rename(self, address: int | str, new_name: str) -> str | bool:
+        """Rename the function at *address*. Returns the actual name used (may
+        differ from new_name if deduplicated), or False on failure."""
+        result = await self._b.rename(address, new_name)
+        actual = result if isinstance(result, str) else (new_name if result else "")
+        if actual and self._funcs:
             a = address if isinstance(address, int) else int(address, 16)
             for f in self._funcs:
                 if f["start"] == a:
-                    f["name"] = new_name
-        return ok
+                    f["name"] = actual
+        return result
 
     # ── AI naming ───────────────────────────────────────────────────────────
 
@@ -400,6 +402,7 @@ class IDADatabase:
         unnamed_only: bool = True,
         rename: bool = True,
         progress_cb=None,
+        plan_cb=None,
     ) -> list[dict]:
         """Deep-analyse a whole call branch, BOTTOM-UP.
 
@@ -444,6 +447,14 @@ class IDADatabase:
         targets = [ad for ad in order
                    if ad in by_addr and (not unnamed_only
                                          or by_addr[ad]["name"].lower().startswith("sub_"))]
+
+        if plan_cb:
+            plan_info = [
+                (ad, by_addr[ad]["name"] if ad in by_addr else hex(ad))
+                for ad in targets
+            ]
+            await plan_cb(plan_info)
+
         results: list[dict] = []
         branch_history: list[dict] = []
         for i, ad in enumerate(targets):

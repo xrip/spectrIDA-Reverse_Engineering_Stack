@@ -35,6 +35,8 @@ class Backend:
     async def name_function_staged(self, pseudocode, lvars, callees, callers,
                                    hints=None, history=None) -> dict: ...
     def stream_name(self, addr, insns, callees, callers) -> AsyncIterator[str]: ...
+    async def get_entry_point(self) -> int | None: ...
+    async def lumina_probe(self) -> list[str] | None: ...
     async def close(self) -> None: ...
 
 
@@ -47,7 +49,28 @@ class RealBackend(Backend):
 
     async def open(self) -> None:
         self._ida = await _ida.open_ida(self.i64)
+        ctx = await _ida.get_binary_context(self._ida)
+        # Append user-defined structs/enums so the LLM knows which types exist
+        # and can apply them when assigning parameter / variable types.
+        try:
+            ltypes = await _ida.get_local_types(self._ida)
+            structs = ltypes.get("structs", [])
+            enums   = ltypes.get("enums",   [])
+            if structs or enums:
+                parts = [ctx.rstrip(), "\nUser-defined types in this binary:"]
+                if structs:
+                    parts.append("  Structs/unions: " + ", ".join(structs[:120]))
+                if enums:
+                    parts.append("  Enums: " + ", ".join(enums[:60]))
+                ctx = "\n".join(parts)
+        except Exception:
+            pass
+        _llamacpp.set_binary_context(ctx)
+        self._lumina_members: list[str] | None = await _ida.lumina_probe(self._ida)
         self._opened = True
+
+    async def lumina_probe(self) -> list[str] | dict | None:
+        return self._lumina_members
 
     async def ensure_open(self) -> None:
         if not self._opened:
@@ -73,8 +96,21 @@ class RealBackend(Backend):
         return await _llamacpp.name_function_staged(
             pseudocode, lvars, callees, callers, hints, history)
 
-    def stream_name(self, addr, insns, callees, callers):
-        return _llamacpp.stream_name(insns, callees, callers)
+    async def stream_name(self, addr, insns, callees, callers):
+        # Fetch pseudocode so the streaming preview uses the same rich context
+        # as the staged naming pass.  Falls back silently to asm-only when
+        # Hex-Rays is not installed or decompilation fails.
+        pseudocode = ""
+        try:
+            pseudocode = await _ida.decompile(self._ida, addr)
+        except Exception:
+            pass
+        async for tok in _llamacpp.stream_name(insns, callees, callers,
+                                                pseudocode=pseudocode):
+            yield tok
+
+    async def get_entry_point(self) -> int | None:
+        return await _ida.get_entry_point(self._ida)
 
     async def close(self):
         if self._ida:
@@ -116,6 +152,12 @@ class DemoBackend(Backend):
 
     def stream_name(self, addr, insns, callees, callers):
         return _demo.stream_name(addr)
+
+    async def get_entry_point(self) -> int | None:
+        return None
+
+    async def lumina_probe(self) -> list[str] | None:
+        return None
 
     async def close(self):
         return None

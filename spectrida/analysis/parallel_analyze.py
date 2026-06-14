@@ -37,48 +37,68 @@ sys.path.insert(0, IDA_DIR)
 DISCOVER_SCRIPT = """
 import sys, json, struct
 
+# 8 KB covers even executables with large DOS stubs (pe_off up to ~0x1000)
 with open(sys.argv[1], 'rb') as f:
-    h = f.read(0x1000)
+    h = f.read(0x2000)
 
 pe_off       = struct.unpack_from('<I', h, 0x3C)[0]
-# COFF header
 num_sections = struct.unpack_from('<H', h, pe_off + 6)[0]
-opt_hdr_size = struct.unpack_from('<H', h, pe_off + 20)[0]   # correct offset
-# Optional header magic: 0x010B=PE32, 0x020B=PE32+
+opt_hdr_size = struct.unpack_from('<H', h, pe_off + 20)[0]
 opt_magic    = struct.unpack_from('<H', h, pe_off + 24)[0]
 is64         = opt_magic == 0x020B
-# ImageBase: offset 28 in PE32 opt hdr, offset 24 in PE32+ opt hdr
 ibase_off    = pe_off + 24 + (24 if is64 else 28)
 image_base   = struct.unpack_from('<Q' if is64 else '<I', h, ibase_off)[0]
 
 sect_off = pe_off + 24 + opt_hdr_size
-min_start = None
-max_end   = None
+
+# Pre-parse all sections so we can apply multiple filter strategies
+CODE_NAMES = {b'.text', b'CODE', b'.code', b'text', b'.TEXT'}
+sections = []
 for i in range(num_sections):
-    o    = sect_off + i * 40
-    name  = h[o:o+8].rstrip(b'\\x00').decode('ascii', errors='replace')
+    o = sect_off + i * 40
+    if o + 40 > len(h):   # section table outside our read buffer - unlikely but safe
+        break
+    name  = h[o:o+8].rstrip(b'\\x00')
     vsize = struct.unpack_from('<I', h, o+8)[0]
     vaddr = struct.unpack_from('<I', h, o+12)[0]
     flags = struct.unpack_from('<I', h, o+36)[0]
-    if flags & 0x20:   # IMAGE_SCN_CNT_CODE
+    if vsize and vaddr:
+        sections.append((name, vaddr, vsize, flags))
+
+def _span(filter_fn, label):
+    lo = hi = None
+    for name, vaddr, vsize, flags in sections:
+        if not filter_fn(name, flags):
+            continue
         start = image_base + vaddr
         end   = start + vsize
-        if min_start is None or start < min_start:
-            min_start = start
-        if max_end is None or end > max_end:
-            max_end = end
-        print(f"# code section '{name}': {start:#x} - {end:#x}", file=sys.stderr)
-if min_start is not None:
-    print(json.dumps({"start": min_start, "end": max_end, "size": max_end - min_start}))
+        lo = start if lo is None else min(lo, start)
+        hi = end   if hi is None else max(hi, end)
+        print(f"# [{label}] '{name.decode('ascii','replace')}': {start:#x}-{end:#x}", file=sys.stderr)
+    return lo, hi
+
+# Tier 1: IMAGE_SCN_CNT_CODE (0x20) — standard flag
+lo, hi = _span(lambda n, f: bool(f & 0x20), "CNT_CODE")
+
+# Tier 2: IMAGE_SCN_MEM_EXECUTE (0x20000000) — Delphi/Borland/some MSVC omit CNT_CODE
+if lo is None:
+    lo, hi = _span(lambda n, f: bool(f & 0x20000000), "MEM_EXEC")
+
+# Tier 3: well-known code section names — last resort for stripped/packed binaries
+if lo is None:
+    lo, hi = _span(lambda n, f: n in CODE_NAMES, "by_name")
+
+if lo is not None:
+    print(json.dumps({"start": lo, "end": hi, "size": hi - lo}))
 else:
     print(json.dumps({"error": "no code segment found"}))
 """
 
 
 def _pe_sections(binary: str):
-    """Return list of (name, va, raw_off, raw_size) for all PE sections."""
+    """Return list of (name, va, raw_off, raw_size, vsize) for all PE sections."""
     with open(binary, "rb") as f:
-        h = f.read(0x1000)
+        h = f.read(0x2000)
     pe_off = struct.unpack_from("<I", h, 0x3C)[0]
     num_sects   = struct.unpack_from("<H", h, pe_off + 6)[0]
     opt_sz      = struct.unpack_from("<H", h, pe_off + 20)[0]
@@ -86,6 +106,8 @@ def _pe_sections(binary: str):
     sects = []
     for i in range(num_sects):
         o = sect_off + i * 40
+        if o + 40 > len(h):
+            break
         name     = h[o:o+8].rstrip(b"\x00").decode("ascii", errors="replace")
         vsize    = struct.unpack_from("<I", h, o+8)[0]
         vaddr    = struct.unpack_from("<I", h, o+12)[0]
@@ -97,13 +119,75 @@ def _pe_sections(binary: str):
 
 def _image_base(binary: str) -> int:
     with open(binary, "rb") as f:
-        h = f.read(0x1000)
+        h = f.read(0x2000)
     pe_off  = struct.unpack_from("<I", h, 0x3C)[0]
     machine = struct.unpack_from("<H", h, pe_off + 4)[0]
     is64    = machine == 0x8664 or machine == 0xAA64
     ibase_off = pe_off + 24 + (28 if not is64 else 24)
     fmt = "<Q" if is64 else "<I"
     return struct.unpack_from(fmt, h, ibase_off)[0]
+
+
+# ── Packer detection + auto-unpack ────────────────────────────────────────────
+
+_PACKER_SIGS: dict[str, set[bytes]] = {
+    "upx":     {b"UPX0", b"UPX1", b"UPX2", b"UPX!"},
+    "mpress":  {b"MPRESS1", b"MPRESS2"},
+    "aspack":  {b".aspack", b".adata"},
+    "themida": {b".themida", b".winlice"},
+    "fsg":     {b".FSG!", b".STUB"},
+}
+
+
+def _detect_packer(binary: str) -> str | None:
+    """Return the packer name if the binary appears packed, else None."""
+    with open(binary, "rb") as f:
+        h = f.read(0x2000)
+    try:
+        pe_off    = struct.unpack_from("<I", h, 0x3C)[0]
+        num_sects = struct.unpack_from("<H", h, pe_off + 6)[0]
+        opt_sz    = struct.unpack_from("<H", h, pe_off + 20)[0]
+        sect_off  = pe_off + 24 + opt_sz
+    except struct.error:
+        return None
+    names: set[bytes] = set()
+    for i in range(num_sects):
+        o = sect_off + i * 40
+        if o + 8 > len(h):
+            break
+        names.add(h[o:o+8].rstrip(b"\x00").upper())
+    for packer, sigs in _PACKER_SIGS.items():
+        if any(s.upper() in names for s in sigs):
+            return packer
+    return None
+
+
+def _try_unpack_upx(binary: str) -> str | None:
+    """Attempt to unpack a UPX binary. Returns path to unpacked copy, or None.
+
+    Copies the binary to a temp file first so the original is untouched.
+    Requires `upx` to be on PATH.
+    """
+    import shutil
+    if not shutil.which("upx"):
+        return None
+    tmp = tempfile.mktemp(suffix=Path(binary).suffix or ".exe",
+                          prefix="spectrida_upx_")
+    shutil.copy2(binary, tmp)
+    try:
+        r = subprocess.run(
+            ["upx", "-d", "-q", tmp],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode == 0:
+            return tmp
+    except Exception:
+        pass
+    try:
+        Path(tmp).unlink(missing_ok=True)
+    except Exception:
+        pass
+    return None
 
 
 def make_shard_binary(src: str, dst: str, shard_start_va: int, shard_end_va: int) -> None:
@@ -141,7 +225,7 @@ def make_shard_binary(src: str, dst: str, shard_start_va: int, shard_end_va: int
 def discover_text_range(binary: str) -> tuple[int, int]:
     """Return (start, end) of the primary code segment."""
     script_path = Path(tempfile.mktemp(suffix=".py"))
-    script_path.write_text(DISCOVER_SCRIPT)
+    script_path.write_text(DISCOVER_SCRIPT, encoding="utf-8")
     result = subprocess.run(
         [PYTHON, str(script_path), binary],
         capture_output=True, text=True,
@@ -203,7 +287,16 @@ shard_jsons = sys.argv[2:]   # list of shard result JSON paths
 
 idapro.open_database(binary, run_auto_analysis=False)
 
-import idc, ida_funcs, idaapi
+import idc, ida_funcs, idaapi, idautils, os as _os
+
+# Load Lumina plugin before auto_wait so IDA queries it during analysis.
+_ida_dir = __import__("os").environ.get("SPECTRIDA_IDALIB") or r"C:\\Program Files\\IDA Professional 9.1"
+_lumina_dll = _os.path.join(_ida_dir, "plugins", "lumina.dll")
+try:
+    idaapi.load_plugin(_lumina_dll)
+    print("[merge] lumina plugin loaded", flush=True)
+except Exception as _e:
+    print(f"[merge] lumina plugin skipped: {_e}", flush=True)
 
 applied = 0
 for path in shard_jsons:
@@ -232,6 +325,22 @@ print(f"[merge] applied {applied} functions, flushing analysis queue...", flush=
 # an inconsistent database state that triggers CRC failure on reload.
 idaapi.auto_wait()
 print(f"[merge] auto_wait done, saving...", flush=True)
+
+# Apply export table names explicitly — IDA may not apply them automatically
+# when functions were pre-created by add_func() during shard merge.
+exports_applied = 0
+for _, _ord, _ea, _nm in idautils.Entries():
+    if _ea == idc.BADADDR or not _nm:
+        continue
+    _fn = idaapi.get_func(_ea)
+    if not _fn:
+        ida_funcs.add_func(_ea)
+    _cur = idc.get_func_name(_ea) or ""
+    if _cur.startswith("sub_") or _cur.startswith("j_") or not _cur:
+        idc.set_name(_ea, _nm, idc.SN_NOWARN | idc.SN_FORCE)
+        exports_applied += 1
+if exports_applied:
+    print(f"[merge] applied {exports_applied} export name(s)", flush=True)
 
 import os, pathlib
 out_dir = pathlib.Path(os.environ.get("SPECTRIDA_OUTPUT_DIR") or r"C:\\Projects\\parallel_ida\\output")
@@ -414,6 +523,20 @@ def main():
 
     print(f"[parallel_analyze] binary: {binary}")
     print(f"[parallel_analyze] workers: {n}")
+
+    # Step 0: Packer detection + auto-unpack
+    packer = _detect_packer(binary)
+    if packer:
+        print(f"[parallel_analyze] WARNING: binary appears packed ({packer})", flush=True)
+        if packer == "upx":
+            unpacked = _try_unpack_upx(binary)
+            if unpacked:
+                print(f"[parallel_analyze] auto-unpacked UPX -> {unpacked}", flush=True)
+                binary = unpacked
+            else:
+                print("[parallel_analyze] install 'upx' on PATH for best results -- proceeding on packed binary", flush=True)
+        else:
+            print(f"[parallel_analyze] no auto-unpack for '{packer}' -- results may be degraded", flush=True)
 
     # Step 1: Discover .text range
     print("[parallel_analyze] discovering code segment...")
