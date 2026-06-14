@@ -427,13 +427,14 @@ class BrowserScreen(Screen):
 
     async def _batch(self) -> None:
         """Whole-binary sweep: deep-name every call branch bottom-up (leaves→roots).
-        Already-named functions are re-entered for variable / return typing."""
+        Already-named functions are re-entered for variable / return typing, then a
+        refine pass re-names low-confidence guesses with full-binary context."""
         await self._run_sweep(
-            scope="all", revisit_named=True,
+            scope="all", revisit_named=True, refine=True,
             mapping_msg="  ▸ mapping whole binary…", label="whole binary")
 
     async def _run_sweep(self, *, scope: str, revisit_named: bool,
-                         mapping_msg: str, label: str) -> None:
+                         mapping_msg: str, label: str, refine: bool = False) -> None:
         """Drive batch_name_branches over the deep-branch tree UI (reset per branch).
 
         Shared by the whole-binary batch ('B') and find-unnamed-branches ('U')."""
@@ -462,25 +463,26 @@ class BrowserScreen(Screen):
                 branch_label[0] = f"branch {idx} · {root_name[:20]} · "
 
             totals = await db.batch_name_branches(
-                scope=scope, rename=True, revisit_named=revisit_named,
+                scope=scope, rename=True, revisit_named=revisit_named, refine=refine,
                 branch_cb=branch_cb, plan_cb=plan_cb, progress_cb=cb)
 
             spin.update("")
+            drop = f", {totals['dropped']} dropped" if totals.get("dropped") else ""
+            ref  = f", {totals['refined']} refined" if totals.get("refined") else ""
+            prop = f", {totals['propagated']} propagated" if totals.get("propagated") else ""
             if not totals["functions"]:
                 rsn.update("")
                 res.update(f"  [dim]nothing to do — no {label} branches found.[/]")
             else:
-                drop = f", {totals['dropped']} dropped" if totals.get("dropped") else ""
                 summary = (f"{label} — {totals['branches']} branches, "
                            f"{totals['named']} named, {totals['vars']} vars, "
-                           f"{totals['typed']} typed{drop}  ·  {voice.quip('naming_done')}")
+                           f"{totals['typed']} typed{drop}{ref}{prop}  ·  {voice.quip('naming_done')}")
                 rsn.update(_render_deep_tree(tree, len(tree), len(tree), summary=summary))
             fl.refresh()
             self._refresh_func_count()
             bar.clear_progress()
-            drop = f", {totals['dropped']} dropped" if totals.get("dropped") else ""
             bar.set_info(f"{self._b.title} · {label} — {totals['named']} named, "
-                         f"{totals['vars']} vars, {totals['typed']} typed{drop}")
+                         f"{totals['vars']} vars, {totals['typed']} typed{drop}{ref}{prop}")
         except Exception as e:
             spin.update("")
             res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")

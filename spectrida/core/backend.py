@@ -31,6 +31,7 @@ class Backend:
     async def get_protos(self, addresses: list) -> dict: ...
     async def get_func_meta(self, addr) -> dict: ...
     async def rename_lvars(self, addr, names: dict, ret_type: str = "") -> dict: ...
+    async def propagate_ret(self, addr) -> dict: ...
     async def name_variables(self, pseudocode: str, lvars: list[dict]) -> dict: ...
     async def correct_types(self, pseudocode: str, failed: list[dict]) -> dict: ...
     async def name_function_staged(self, pseudocode, lvars, callees, callers,
@@ -88,6 +89,9 @@ class RealBackend(Backend):
     async def get_func_meta(self, addr): return await _ida.get_func_meta(self._ida, addr)
     async def rename_lvars(self, addr, names, ret_type=""):
         return await _ida.rename_lvars(self._ida, addr, names, ret_type)
+
+    async def propagate_ret(self, addr):
+        return await _ida.propagate_ret(self._ida, addr)
 
     async def name_variables(self, pseudocode, lvars):
         return await _llamacpp.name_variables(pseudocode, lvars)
@@ -148,6 +152,9 @@ class DemoBackend(Backend):
     async def get_func_meta(self, addr): return _demo.get_func_meta(addr)
     async def rename_lvars(self, addr, names, ret_type=""):
         return _demo.rename_lvars(addr, names, ret_type)
+
+    async def propagate_ret(self, addr):
+        return _demo.propagate_ret(addr)
     async def name_variables(self, pseudocode, lvars):
         return _demo.name_variables(pseudocode, lvars)
 

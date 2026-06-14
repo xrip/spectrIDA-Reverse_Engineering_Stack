@@ -197,6 +197,14 @@ def type_retry_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def type_propagation_enabled() -> bool:
+    """Push a function's pointer/struct return type onto caller variables that
+    receive it (default ON). Disable with SPECTRIDA_TYPE_PROPAGATION=0.
+    """
+    raw = get("pipeline", "type_propagation", "SPECTRIDA_TYPE_PROPAGATION").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def name_cache_enabled() -> bool:
     """Cache naming results by normalized function content (default on).
 

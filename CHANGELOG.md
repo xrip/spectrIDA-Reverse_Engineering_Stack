@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Confidence + refine pass (whole-binary).** Each naming result now carries a
+  confidence (`high`/`medium`/`low`); low-confidence guesses are kept out of the
+  project glossary (no vocabulary pollution). The `B` whole-binary sweep runs a
+  second **refine** pass over low-confidence functions once the whole binary is
+  named (richer glossary + resolved neighbours), bypassing the name cache.
+- **Return-type propagation.** When a function is typed to return a pointer /
+  struct / enum, that type is pushed onto caller variables that receive the
+  result (Hex-Rays ctree walk), but only over generic placeholders so a better
+  existing type is never clobbered. Toggle `SPECTRIDA_TYPE_PROPAGATION=0`.
 - **Content-addressed name cache.** Naming results are keyed by the *normalized*
   function body (addresses, `sub_`/`loc_`/data refs, `aN`/`vN`, literals masked) +
   call-chain + distinctive hints (`spectrida/core/namecache.py`), so

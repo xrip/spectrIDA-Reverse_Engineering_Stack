@@ -240,6 +240,12 @@ def correct_types(pseudocode: str, failed: list[dict]) -> dict:
     return {f["var"]: "int" for f in failed if f.get("var")}
 
 
+def propagate_ret(addr) -> dict:
+    """Demo: pretend each caller has one variable that takes the result."""
+    callers = xrefs_to(addr)
+    return {"propagated": len(callers), "callers": len(callers)}
+
+
 def rename_lvars(addr, names: dict, ret_type: str = "") -> dict:
     st = _demo_state(_norm(addr))
     code = st["pseudocode"]

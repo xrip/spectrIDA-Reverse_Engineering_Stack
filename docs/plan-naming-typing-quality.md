@@ -1,7 +1,9 @@
 # Implementation Plan — Naming Uniformity & Typing Correctness (E + A + B)
 
-> **Status:** E ✅ · A ✅ · B ✅ · E-2 ✅ (opt-in retry) — done (42 tests green).
+> **Status:** E ✅ · A ✅ · B ✅ · E-2 ✅ · H+I ✅ · D ✅ — done (49 tests green).
 > Also added: scrollable TUI report pane (`[`/`]` + wheel).
+> Remaining (broader proposal, not yet built): F (struct recovery),
+> C (naming-canonicalization linter), disasm-path caching.
 > Deviation in A: domain vocabulary is auto-derived from name stems (zero-cost,
 > deterministic) instead of parsing `overview()` prose; `seed_overview` not added.
 > Note: B's worker growth from E required moving the idalib worker off `python -c`

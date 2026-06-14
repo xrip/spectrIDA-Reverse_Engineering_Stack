@@ -22,8 +22,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TypedDict
 
-from spectrida.config import name_cache_enabled, type_retry_enabled
+from spectrida.config import (
+    name_cache_enabled,
+    type_propagation_enabled,
+    type_retry_enabled,
+)
 from spectrida.core import namecache
+from spectrida.core.types import extract_type_identifiers
 from spectrida.core.backend import DemoBackend, RealBackend
 from spectrida.core.glossary import Glossary
 from spectrida.core.namecache import NameCache
@@ -96,6 +101,43 @@ def _addr_int(x: dict) -> int | None:
         except ValueError:
             return None
     return None
+
+
+# Names that carry no real meaning — the model guessing rather than knowing.
+_GENERIC_NAMES = frozenset({
+    "process", "handle", "do_stuff", "run", "execute", "thing", "helper",
+    "callback", "function", "func", "proc", "stuff", "work", "do_work",
+    "main_loop", "init_stuff", "routine", "subroutine", "unknown", "sub",
+})
+
+
+def _worth_propagating(ret_type: str) -> bool:
+    """A return type worth pushing onto callers: a pointer or a named struct/enum
+    (not a plain scalar like int/void)."""
+    if not ret_type:
+        return False
+    if "*" in ret_type:
+        return True
+    return bool(extract_type_identifiers(ret_type))
+
+
+def _name_confidence(new_name: str, source: str, hints: dict | None) -> str:
+    """Heuristic confidence in a name: "high" | "medium" | "low".
+
+    Low when there's no name or a generic guess. Disassembly-only naming (no
+    decompiler) is weaker than pseudocode; the presence of strong signals
+    (API calls / strings / recognised constants) lifts confidence.
+    """
+    if not new_name:
+        return "low"
+    if new_name.lower() in _GENERIC_NAMES:
+        return "low"
+    h = hints or {}
+    has_signal = bool(h.get("api_calls") or h.get("strings")
+                      or h.get("classified_constants"))
+    if source == "disasm":                     # no decompiler output at all
+        return "medium" if has_signal else "low"
+    return "high" if has_signal else "medium"
 
 
 def _has_pseudocode(pseudocode: str) -> bool:
@@ -340,6 +382,7 @@ class IDADatabase:
         rename: bool = False,
         rename_function: bool = True,
         llm_history: list[dict] | None = None,
+        use_cache: bool = True,
     ) -> dict:
         """Name + type a function via a 3-stage LLM CONVERSATION.
 
@@ -393,7 +436,7 @@ class IDADatabase:
         if _has_pseudocode(pseudocode):
             await self._ensure_cache_loaded()
             ck = namecache.key(pseudocode, callees, callers, hints)
-            cached = self._cache.get(ck)
+            cached = self._cache.get(ck) if use_cache else None
             if cached is not None:
                 # identical function seen before → reuse name/types verbatim
                 new_name  = cached.get("name", "")
@@ -468,18 +511,32 @@ class IDADatabase:
                             fixed = attempted - still
                             dropped = [d for d in dropped if d["var"] not in fixed]
 
+        # D: propagate an interesting (pointer/struct) return type onto caller
+        # variables that receive this function's result. Cheap-skip plain scalars.
+        propagated = 0
+        if (rename and applied_ret and type_propagation_enabled()
+                and _worth_propagating(applied_ret)):
+            try:
+                pr = await self._b.propagate_ret(a)
+                propagated = pr.get("propagated", 0)
+            except Exception:
+                propagated = 0
+
+        confidence = _name_confidence(new_name, source, hints)
+
         # grow the project glossary with the actually-assigned name (newly named
-        # functions only — revisited named funcs are already seeded)
-        if applied_name:
+        # functions only — revisited named funcs are already seeded). Gating (I):
+        # don't pollute the shared vocabulary with low-confidence guesses.
+        if applied_name and confidence != "low":
             self._glossary.add_name(a, applied_name)
 
         return {
             "address": a, "old_name": old_name, "new_name": new_name,
-            "source": source,
+            "source": source, "confidence": confidence,
             "reasoning": reasoning, "variables": variables,
             "ret_type": applied_ret or ret_type,
             "renamed_vars": renamed_vars, "retyped_vars": retyped_vars,
-            "dropped": dropped,
+            "dropped": dropped, "propagated": propagated,
             "pseudocode": pseudocode,
         }
 
@@ -637,6 +694,7 @@ class IDADatabase:
         scope: str = "all",
         rename: bool = True,
         revisit_named: bool = True,
+        refine: bool = False,
         max_depth: int = 64,
         max_funcs_per_branch: int = 100_000,
         branch_cb=None,
@@ -664,13 +722,19 @@ class IDADatabase:
                             applied (like the interactive 'V' action) without
                             being renamed. For scope="unnamed" pass False to focus
                             purely on naming the sub_* functions.
+            refine: after the sweep, run a SECOND pass over functions that were
+                            named with low confidence (generic/weak guesses), now
+                            that the whole binary has context (full glossary, named
+                            neighbours). The refine pass bypasses the name cache so
+                            the model re-reasons with the richer context.
 
         Callbacks:
             branch_cb:   async (branch_idx, root_name, root_addr) — a new branch begins
             plan_cb:     forwarded to name_branch — per-branch tree plan
             progress_cb: forwarded to name_branch — per-function progress
 
-        Returns {"branches", "functions", "named", "vars", "typed"}.
+        Returns {"branches", "functions", "named", "vars", "typed", "dropped",
+        "refined"}.
         """
         funcs = await self.list_functions()
         by_addr = {f["start"]: f for f in funcs}
@@ -701,7 +765,14 @@ class IDADatabase:
 
         shared: set[int] = set()
         totals = {"branches": 0, "functions": 0, "named": 0, "vars": 0,
-                  "typed": 0, "dropped": 0}
+                  "typed": 0, "dropped": 0, "refined": 0, "propagated": 0}
+        low_conf: list[int] = []   # sub_* funcs named with low confidence (for refine)
+
+        def _tally(r: dict) -> None:
+            totals["vars"]  += r.get("renamed_vars", 0)
+            totals["typed"] += r.get("retyped_vars", 0)
+            totals["dropped"] += len(r.get("dropped") or [])
+            totals["propagated"] += r.get("propagated", 0)
 
         async def _run_branch(start: int) -> None:
             totals["branches"] += 1
@@ -715,11 +786,12 @@ class IDADatabase:
             )
             for r in res:
                 totals["functions"] += 1
-                if r.get("new_name") and r.get("old_name", "").lower().startswith("sub_"):
+                was_sub = r.get("old_name", "").lower().startswith("sub_")
+                if r.get("new_name") and was_sub:
                     totals["named"] += 1
-                totals["vars"]  += r.get("renamed_vars", 0)
-                totals["typed"] += r.get("retyped_vars", 0)
-                totals["dropped"] += len(r.get("dropped") or [])
+                    if refine and r.get("confidence") == "low":
+                        low_conf.append(r["address"])
+                _tally(r)
 
         for r in roots:
             if r not in shared:
@@ -731,6 +803,24 @@ class IDADatabase:
             while remaining:
                 await _run_branch(remaining[0])
                 remaining = [a for a in sorted(by_addr) if a not in shared]
+
+        # H: refine pass — re-name low-confidence functions now that the whole
+        # binary is named (richer glossary + resolved neighbours). Cache bypassed.
+        if refine and low_conf:
+            totals["branches"] += 1
+            if branch_cb:
+                await branch_cb(totals["branches"], "refine low-confidence", low_conf[0])
+            if plan_cb:
+                await plan_cb([(ad, by_addr.get(ad, {}).get("name", hex(ad)))
+                               for ad in low_conf])
+            for i, ad in enumerate(low_conf):
+                before = by_addr.get(ad, {}).get("name", "")
+                r = await self.name_all(ad, rename=rename, use_cache=False)
+                if r.get("new_name") and r["new_name"] != before:
+                    totals["refined"] += 1
+                _tally(r)
+                if progress_cb:
+                    await progress_cb(i + 1, len(low_conf), r)
 
         return totals
 

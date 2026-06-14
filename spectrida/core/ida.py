@@ -377,6 +377,73 @@ for line in sys.stdin:
             for addr in a.get("addresses", []):
                 ea = _norm(addr); out[hex(ea)] = _proto(ea)
             emit({"ok": True, "result": out})
+        elif cmd == "propagate_ret":
+            # D — return-type propagation: once a callee's return type is known and
+            # interesting (pointer / struct / enum), push it onto each caller's
+            # local variable that receives the call result, but only when that
+            # variable is still a generic placeholder (don't clobber a better type).
+            try:
+                import ida_hexrays, ida_typeinf
+                callee = _norm(a["address"])
+                rt = None
+                ftif = ida_typeinf.tinfo_t()
+                if idaapi.get_tinfo(ftif, callee) and ftif.is_func():
+                    fd = ida_typeinf.func_type_data_t()
+                    if ftif.get_func_details(fd):
+                        rt = fd.rettype
+                interesting = bool(rt is not None and not rt.is_void()
+                                   and (rt.is_ptr() or rt.is_udt() or rt.is_enum()))
+                propagated = 0; ncallers = 0
+                _GENERIC = {"__int64", "unsigned __int64", "int", "unsigned int",
+                            "__int32", "unsigned __int32", "_DWORD", "_QWORD",
+                            "_BYTE", "_OWORD", "void *", "char *", "__int64 *",
+                            "int *", "_UNKNOWN *", "_DWORD *", "_QWORD *"}
+                if interesting:
+                    _seen = set()
+                    for xr in idautils.XrefsTo(callee):
+                        _fn = idaapi.get_func(xr.frm)
+                        if not _fn or _fn.start_ea in _seen or _fn.start_ea == callee:
+                            continue
+                        _seen.add(_fn.start_ea); ncallers += 1
+                        try:
+                            _cf = idaapi.decompile(_fn.start_ea)
+                        except Exception:
+                            _cf = None
+                        if not _cf:
+                            continue
+                        _targets = []
+                        class _RetV(ida_hexrays.ctree_visitor_t):
+                            def __init__(self):
+                                ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+                            def visit_expr(self, e):
+                                if e.op == ida_hexrays.cot_asg:
+                                    rhs = e.y
+                                    while rhs is not None and rhs.op == ida_hexrays.cot_cast:
+                                        rhs = rhs.x
+                                    if (rhs is not None and rhs.op == ida_hexrays.cot_call
+                                            and rhs.x.op == ida_hexrays.cot_obj
+                                            and rhs.x.obj_ea == callee
+                                            and e.x.op == ida_hexrays.cot_var):
+                                        _targets.append(e.x.v.idx)
+                                return 0
+                        try:
+                            _RetV().apply_to(_cf.body, None)
+                        except Exception:
+                            _targets = []
+                        if not _targets:
+                            continue
+                        _lvs = _cf.get_lvars()
+                        for _idx in set(_targets):
+                            if _idx < 0 or _idx >= _lvs.size():
+                                continue
+                            _lv = _lvs[_idx]
+                            if str(_lv.type()) not in _GENERIC:
+                                continue
+                            if _set_lvar_type(_fn.start_ea, _lv.name, rt):
+                                propagated += 1
+                emit({"ok": True, "result": {"propagated": propagated, "callers": ncallers}})
+            except Exception as e:
+                emit({"ok": False, "error": "propagate_ret: %s" % e})
         elif cmd == "func_meta":
             # extra naming hints: compact RE facts that help the model name and type
             # the function without dumping unbounded disassembly into the prompt.
@@ -1009,6 +1076,18 @@ async def rename_lvars(ida: IDAHandle, address: str | int, names: dict,
         return result
     except Exception:
         return {"renamed": 0, "retyped": 0, "ret_type": "", "dropped": [], "pseudocode": ""}
+
+
+async def propagate_ret(ida: IDAHandle, address: str | int) -> dict:
+    """Push a function's (interesting) return type onto caller variables that hold
+    its result. Returns {"propagated": N, "callers": M}."""
+    try:
+        result = await ida.call("propagate_ret", address=_hex(address))
+        if result.get("propagated"):
+            await ida.call("save")
+        return result
+    except Exception:
+        return {"propagated": 0, "callers": 0}
 
 
 def _hex(address: str | int) -> str:
