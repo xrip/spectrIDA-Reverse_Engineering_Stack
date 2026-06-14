@@ -212,18 +212,24 @@ for line in sys.stdin:
                         else:
                             _seen[nm] = 1
                     arg_specs = {}; arg_renames = 0
+                    arg_idx = 0  # positional index in func_type_data_t
                     for lv in cf.get_lvars():
-                        spec = norm.get(lv.name)
-                        if not spec:
-                            continue
-                        new = spec["name"]; ty = spec["type"]
                         if lv.is_arg_var:
-                            # default arg name aN → prototype param index N-1
-                            if lv.name[:1] == "a" and lv.name[1:].isdigit():
-                                arg_specs[int(lv.name[1:]) - 1] = {"name": new, "type": ty}
+                            # Map by POSITION, not by name — name-based indexing
+                            # (a1→0, a2→1) breaks for __thiscall where `this` is
+                            # arg 0 and a1 is arg 1, and skips non-aN names like `this`.
+                            spec = norm.get(lv.name)
+                            if spec:
+                                new = spec["name"]; ty = spec["type"]
+                                arg_specs[arg_idx] = {"name": new, "type": ty}
                                 if new and new != lv.name and new.isidentifier():
                                     arg_renames += 1
+                            arg_idx += 1
                         else:
+                            spec = norm.get(lv.name)
+                            if not spec:
+                                continue
+                            new = spec["name"]; ty = spec["type"]
                             cur = lv.name
                             if new and new != lv.name and new.isidentifier():
                                 if ida_hexrays.rename_lvar(func_ea, lv.name, new):
