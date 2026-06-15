@@ -1,10 +1,16 @@
 # Implementation Plan — Naming Uniformity & Typing Correctness (E + A + B)
 
-> **Status:** E ✅ · A ✅ · B ✅ · E-2 ✅ · H+I ✅ · D ✅ · F ✅ — done (69 tests green).
+> **Status:** E ✅ · A ✅ · B ✅ · E-2 ✅ · H+I ✅ · D ✅ · F ✅ · G ✅ — done (81 tests green).
 > Also added: scrollable TUI report pane (`[`/`]` + wheel).
 > Remaining (broader proposal, not yet built):
-> **G (global variable naming + typing — speced below)**,
 > C (naming-canonicalization linter), disasm-path caching.
+> G notes: quality scoring is pure (`core/globals.py` `function_quality` /
+> `rank_globals` / `is_generic_global`, mirrored inline in the worker). Worker
+> `list_globals` (generic-data names w/ ≥min_xrefs code refs) + `global_context`
+> (ranks referencing funcs, returns top-K snippets + access kinds via ctree) +
+> `set_global` (name FIRST, then type — E validation + read-back). Driver
+> `name_globals`, TUI key `G`, `SPECTRIDA_GLOBAL_NAMING` (default on). Runs after
+> the `B` sweep; a pointer/struct type on a global seeds D propagation.
 > F notes: layout engine is pure (`core/structs.py`); worker harvests evidence
 > (`struct_evidence`) + registers via `parse_decls` of a host-built C decl
 > (`make_struct`) + applies through the prototype (`apply_struct`, rename→type

@@ -16,7 +16,12 @@ from textual.widgets import Input, Label, Static
 
 from spectrida import voice
 from spectrida.core.backend import Backend
-from spectrida.tui.screens.dialogs import HelpScreen, OverviewScreen, RenameDialog
+from spectrida.tui.screens.dialogs import (
+    HelpScreen,
+    MinXrefsDialog,
+    OverviewScreen,
+    RenameDialog,
+)
 from spectrida.tui.widgets.disasm import DisasmPane, is_sub
 from spectrida.tui.widgets.funclist import FuncList
 from spectrida.tui.widgets.statusbar import StatusBar
@@ -150,6 +155,7 @@ class BrowserScreen(Screen):
         Binding("u", "unnamed_branches", "Unnamed"),
         Binding("t", "deep_branch", "Deep"),
         Binding("f", "recover_structs", "Structs"),
+        Binding("g", "name_globals", "Globals"),
         Binding("o", "overview", "Overview"),
         Binding("bracketright", "scroll_report_down", "Report▼", show=False),
         Binding("bracketleft", "scroll_report_up", "Report▲", show=False),
@@ -664,20 +670,34 @@ class BrowserScreen(Screen):
         spin = self.query_one("#model-spinner", Static)
         self.query_one("#model-hint", Static).update("")
         rsn.update("")
-        spin.update("  ▸ recovering structs from field accesses…")
-        recovered: list[str] = []
+        spin.update("  ▸ scanning functions for recoverable structs…")
+        log: list[str] = []
         try:
             from spectrida.api import IDADatabase
             db = IDADatabase(self._b)
 
-            async def progress_cb(done: int, addr: int, r: dict) -> None:
-                if r.get("ok"):
-                    tag = "reused" if r.get("reused") else (
-                        "applied" if r.get("applied") else "made")
-                    recovered.append(f"  [b cyan]{r['struct']}[/] "
-                                     f"[dim]({r['fields']} fields, {tag})[/]")
-                    spin.update(f"  ▸ recovered {len(recovered)} struct(s)…")
-                    rsn.update("\n".join(recovered[-40:]))
+            async def progress_cb(done: int, total: int, info: dict) -> None:
+                fn = (info.get("func") or "")[:26]
+                bar.set_progress(done, total, fn)
+                spin.update(f"  ▸ structs {done}/{total} · scanning {fn}…")
+                changed = False
+                for it in info.get("items", []):
+                    r = it["result"]; arg = it["arg"]
+                    if r.get("ok"):
+                        tag = ("reused" if r.get("reused")
+                               else "applied" if r.get("applied") else "made")
+                        col = "green" if r.get("applied") or r.get("reused") else "yellow"
+                        drop = (f" [red]+{len(r['dropped'])} dropped[/]"
+                                if r.get("dropped") else "")
+                        log.append(f"  [dim]{fn}[/] a{arg} → [b {col}]{r['struct']}[/] "
+                                   f"[dim]({r['fields']}f, {tag})[/]{drop}")
+                        changed = True
+                    elif r.get("fields"):   # had field evidence but didn't make a struct
+                        log.append(f"  [dim]{fn} a{arg}: {r['fields']}f — "
+                                   f"{r.get('reason', 'skipped')}[/]")
+                        changed = True
+                if changed:
+                    rsn.update("\n".join(log[-40:]))
 
             totals = await db.recover_structs(scope="named", progress_cb=progress_cb)
             spin.update("")
@@ -686,14 +706,96 @@ class BrowserScreen(Screen):
             if not totals["structs"]:
                 res.update("  [dim]no recoverable structs — run naming ('B') first, "
                            "or no generic pointer params with field accesses.[/]")
+                if not log:
+                    rsn.update("  [dim]scanned every named function · "
+                               "no generic pointer params dereferenced at ≥2 offsets.[/]")
             else:
                 res.update(f"  [b cyan]{totals['structs']}[/] structs · "
                            f"[b green]{totals['applied']}[/] applied · "
-                           f"[magenta]{totals['fields']}[/] fields{reuse}{drop}")
-                if not recovered:
-                    rsn.update(f"  recovered across {totals['functions']} functions")
+                           f"[magenta]{totals['fields']}[/] fields{reuse}{drop}  ·  "
+                           f"{voice.quip('naming_done')}")
             bar.set_info(f"{self._b.title} · structs — {totals['structs']} recovered, "
                          f"{totals['applied']} applied{drop}")
+        except Exception as e:
+            spin.update("")
+            res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")
+        finally:
+            self._busy = False
+            try:
+                self.query_one(StatusBar).clear_progress()
+            except Exception:
+                pass
+
+    # ── global naming (name + type generic globals from their use sites) ──
+    def action_name_globals(self) -> None:
+        if self._busy:
+            self.notify("still working — wait a moment", severity="warning")
+            return
+        # ask for the minimum xref count first (more xrefs = higher-leverage globals)
+        self.app.push_screen(MinXrefsDialog(default=3), self._after_minxrefs)
+
+    def _after_minxrefs(self, min_xrefs: int | None) -> None:
+        if min_xrefs is None:        # cancelled
+            return
+        self._spawn(self._name_globals(min_xrefs))
+
+    async def _name_globals(self, min_xrefs: int = 3) -> None:
+        """Name + type generic globals (dword_*, byte_*, …) from their best-
+        understood referencing functions. Best run after the 'B' naming sweep."""
+        self._busy = True
+        res  = self.query_one("#model-result", Static)
+        rsn  = self.query_one("#model-reason", Static)
+        bar  = self.query_one(StatusBar)
+        spin = self.query_one("#model-spinner", Static)
+        self.query_one("#model-hint", Static).update("")
+        rsn.update("")
+        spin.update(f"  ▸ enumerating generic globals (≥{min_xrefs} xrefs)…")
+        log: list[str] = []
+        try:
+            from spectrida.api import IDADatabase
+            db = IDADatabase(self._b)
+
+            async def progress_cb(done: int, total: int, info: dict) -> None:
+                phase = info.get("phase")
+                if phase == "enumerated":
+                    spin.update(f"  ▸ found {total} global(s) ≥{min_xrefs} xrefs — "
+                                f"analysing use sites…")
+                    rsn.update(f"  [dim]{total} candidate global(s); reading the "
+                               f"best-understood functions that touch each…[/]")
+                    return
+                if phase == "analyze":
+                    nm = (info.get("name") or "")[:28]
+                    spin.update(f"  ▸ globals {done}/{total} · {nm} "
+                                f"({info.get('nxrefs', 0)} xrefs)…")
+                    return
+                bar.set_progress(done, total, info.get("name", ""))
+                if phase == "skip":
+                    log.append(f"  [dim]{(info.get('name') or '')[:28]} — skipped "
+                               f"({info.get('reason', '')})[/]")
+                else:  # done
+                    ty = info.get("type", "")
+                    tpart = f" : [magenta]{ty}[/]" if ty else ""
+                    drop = (f" · [red]{len(info['dropped'])} dropped[/]"
+                            if info.get("dropped") else "")
+                    log.append(f"  [dim]{info.get('old_name', '')}[/] → "
+                               f"[b green]{info.get('name', '')}[/]{tpart} "
+                               f"[dim]({info.get('nxrefs', 0)} xrefs, "
+                               f"{info.get('sites', 0)} sites)[/]{drop}")
+                rsn.update("\n".join(log[-40:]))
+
+            totals = await db.name_globals(min_xrefs=min_xrefs, progress_cb=progress_cb)
+            spin.update("")
+            drop = f", {totals['dropped']} dropped" if totals.get("dropped") else ""
+            if not totals["globals"]:
+                res.update(f"  [dim]no globals named — none have ≥{min_xrefs} xrefs, "
+                           f"or run naming ('B') first for better context.[/]")
+            else:
+                res.update(f"  [b cyan]{totals['globals']}[/] globals · "
+                           f"[b green]{totals['named']}[/] named · "
+                           f"[magenta]{totals['typed']}[/] typed{drop}  ·  "
+                           f"{voice.quip('naming_done')}")
+            bar.set_info(f"{self._b.title} · globals — {totals['named']} named, "
+                         f"{totals['typed']} typed{drop}")
         except Exception as e:
             spin.update("")
             res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")

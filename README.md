@@ -137,6 +137,7 @@ spectrida onboard
 | `B` | Batch — deep-name the **whole binary**, branch by branch, bottom-up (types named funcs too) |
 | `U` | Find unnamed branches — deep-name every `sub_*` function's branch, bottom-up |
 | `F` | Recover structs from field-access patterns and apply them to pointer params |
+| `G` | Name + type generic globals (`dword_*`, …) from their best use sites |
 | `O` | Overview — AI summary of the whole binary |
 | `/` | Fuzzy search |
 | `?` | Help |

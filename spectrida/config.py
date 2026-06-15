@@ -213,6 +213,14 @@ def struct_recovery_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def global_naming_enabled() -> bool:
+    """Name + type generic globals (dword_*, byte_*, …) from their best use sites
+    (default ON). Disable with SPECTRIDA_GLOBAL_NAMING=0.
+    """
+    raw = get("pipeline", "global_naming", "SPECTRIDA_GLOBAL_NAMING").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def name_cache_enabled() -> bool:
     """Cache naming results by normalized function content (default on).
 

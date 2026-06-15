@@ -23,12 +23,14 @@ from pathlib import Path
 from typing import TypedDict
 
 from spectrida.config import (
+    global_naming_enabled,
     name_cache_enabled,
     struct_recovery_enabled,
     type_propagation_enabled,
     type_retry_enabled,
 )
 from spectrida.core import namecache
+from spectrida.core.globals import rank_globals
 from spectrida.core.structs import (
     merge_field_names,
     reconcile_fields,
@@ -658,6 +660,9 @@ class IDADatabase:
         Returns ``{"functions", "structs", "fields", "applied", "reused",
         "dropped"}``.
         """
+        if rename and not struct_recovery_enabled():
+            return {"functions": 0, "structs": 0, "fields": 0, "applied": 0,
+                    "reused": 0, "dropped": 0}
         funcs = await self.list_functions()
         if scope == "named":
             targets = [f for f in funcs if not f["name"].lower().startswith("sub_")]
@@ -667,16 +672,18 @@ class IDADatabase:
 
         totals = {"functions": 0, "structs": 0, "fields": 0, "applied": 0,
                   "reused": 0, "dropped": 0}
-        done = 0
-        for f in targets:
+        total = len(targets)
+        for fi, f in enumerate(targets):
             info = await self._b.get_lvars(f["start"])
             args = [lv for lv in info.get("lvars", []) if lv.get("is_arg")]
+            items: list[dict] = []
             recovered_here = False
             for idx, lv in enumerate(args):
                 if not _struct_candidate_type(lv.get("type", "")):
                     continue
                 r = await self.recover_struct(f["start"], idx,
                                               min_fields=min_fields, rename=rename)
+                items.append({"arg": idx, "var": lv.get("name", ""), "result": r})
                 if r.get("ok"):
                     recovered_here = True
                     totals["structs"] += 1
@@ -684,11 +691,98 @@ class IDADatabase:
                     totals["applied"] += 1 if r.get("applied") else 0
                     totals["reused"] += 1 if r.get("reused") else 0
                 totals["dropped"] += len(r.get("dropped") or [])
-                if progress_cb:
-                    done += 1
-                    await progress_cb(done, f["start"], r)
             if recovered_here:
                 totals["functions"] += 1
+            # fire once per function (even with no candidate args) so the caller
+            # sees a steady 1..total scan, not silence until the first hit
+            if progress_cb:
+                await progress_cb(fi + 1, total,
+                                  {"func": f["name"], "addr": f["start"], "items": items})
+        return totals
+
+    # ── global variable naming + typing (G) ───────────────────────────────────
+
+    async def name_globals(
+        self,
+        *,
+        top_k: int = 5,
+        min_xrefs: int = 2,
+        limit: int = 100_000,
+        rename: bool = True,
+        progress_cb=None,
+    ) -> dict:
+        """Name + type generic globals (``dword_*``, ``byte_*``, ``off_*``, …) from
+        their best-understood use sites.
+
+        For each global, ranked by leverage (xref count), the worker selects the
+        top-``top_k`` referencing functions by analysis quality (named / typed /
+        signal-rich — see ``core.globals.function_quality``) and returns windowed
+        snippets + access kinds; the model proposes a name + type, which is applied
+        (name first, then type — validated + read-back). A pointer/struct type on a
+        global is a natural seed for return-type propagation (D).
+
+        Best run AFTER the whole-binary naming sweep (``B``) so the referencing
+        functions are already named/typed — maximum context quality.
+
+        Returns ``{"globals", "named", "typed", "dropped"}``.
+        """
+        totals = {"globals": 0, "named": 0, "typed": 0, "dropped": 0}
+        if rename and not global_naming_enabled():
+            return totals
+        try:
+            raw = await self._b.list_globals(min_xrefs)
+        except Exception:
+            raw = []
+        ranked = rank_globals([g for g in raw
+                               if int(g.get("nxrefs", 0)) >= min_xrefs])[:limit]
+        await self._ensure_glossary_seed()
+
+        total = len(ranked)
+        # phase callbacks let the UI explain the (slow) per-global analysis:
+        # enumeration → "analysing X (n xrefs)" → result, instead of a dead spinner.
+        if progress_cb:
+            await progress_cb(0, total, {"phase": "enumerated"})
+        for gi, g in enumerate(ranked):
+            ea = g["ea"]; gname = g.get("name", ""); nx = g.get("nxrefs", 0)
+            if progress_cb:
+                await progress_cb(gi, total,
+                                  {"phase": "analyze", "name": gname, "nxrefs": nx})
+            ctx = await self._b.global_context(ea, top_k)
+            sites = ctx.get("sites", [])
+            if not sites:
+                if progress_cb:
+                    await progress_cb(gi + 1, total, {"phase": "skip", "name": gname,
+                                                      "nxrefs": nx, "reason": "no use sites"})
+                continue
+            staged = await self._b.name_global(
+                ctx, sites, glossary=self._glossary.render())
+            nm = staged.get("name", ""); ty = staged.get("type", "")
+            if not nm and not ty:
+                if progress_cb:
+                    await progress_cb(gi + 1, total, {"phase": "skip", "name": gname,
+                                                      "nxrefs": nx, "reason": "model gave no name"})
+                continue
+            totals["globals"] += 1
+            applied_name = ""
+            dropped: list[dict] = []
+            if rename:
+                r = await self._b.set_global(ea, nm, ty)
+                if r.get("named"):
+                    totals["named"] += 1
+                    applied_name = r["named"]
+                if r.get("typed"):
+                    totals["typed"] += 1
+                dropped = r.get("dropped", []) or []
+                totals["dropped"] += len(dropped)
+                # grow the glossary so later globals/functions reuse the vocabulary
+                if applied_name:
+                    self._glossary.add_name(ea, applied_name)
+            if progress_cb:
+                await progress_cb(gi + 1, total, {
+                    "phase": "done", "name": applied_name or nm, "type": ty,
+                    "old_name": gname, "nxrefs": nx, "sites": len(sites),
+                    "dropped": dropped, "reason": staged.get("reason", ""),
+                })
         return totals
 
     async def name_branch(

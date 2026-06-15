@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Global variable naming + typing (`G`).** Names and types the binary's generic
+  globals (`dword_*`, `byte_*`, `off_*`, …) from how the **best-understood**
+  functions use them. Each global is ranked by leverage (xref count); for each,
+  the referencing functions are ranked by analysis quality (named / typed /
+  API-and-string-rich — `core/globals.py function_quality`, pure + tested) and only
+  the top-K feed the model with windowed snippets + access kinds (read / write /
+  address-taken). The name is applied first, then the type (validated + read-back,
+  like E) — failures surface as `dropped`, never silent. A pointer/struct type on
+  a global seeds return-type propagation (D). Best run after the `B` sweep. `G`
+  first prompts for a **minimum xref count** (default 3) so you can focus on the
+  high-leverage globals. The MODEL pane streams a readable live log — enumeration
+  count, `analysing <name> (n xrefs)…` per global, then `old → new : type` results
+  (skips shown dimmed). Kill switch `SPECTRIDA_GLOBAL_NAMING=0`.
 - **Struct recovery from field accesses (`F`).** Recovers a C struct for a
   function's generic pointer parameter from the offsets/sizes it's dereferenced
   at, names the struct + fields (LLM), registers it in IDA, and sets the
@@ -11,7 +24,9 @@
   names fields and refines scalar types, it can't move offsets. Widest-access-wins,
   padding gaps filled, overlaps flagged `union_candidate`, pointer fields detected.
   Structurally identical pointers collapse to one struct (`struct_signature`).
-  Names are applied **before** typing (IDA splits the two ops). Driver
+  Names are applied **before** typing (IDA splits the two ops). The MODEL pane
+  streams a live `structs done/total · scanning <fn>` log so a long sweep is
+  legible instead of a silent spinner. Driver
   `recover_struct` / `recover_structs` (run after the `B` sweep for best context;
   a recovered `Struct *` then seeds return-type propagation). Kill switch
   `SPECTRIDA_STRUCT_RECOVERY=0`.

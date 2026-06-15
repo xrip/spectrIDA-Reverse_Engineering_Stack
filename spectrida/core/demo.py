@@ -305,6 +305,63 @@ def apply_struct(addr, arg_index: int, type_str: str) -> dict:
     return {"applied": True, "dropped": []}
 
 
+# ── global naming (demo, G) ──────────────────────────────────────────────────
+
+_DEMO_GLOBALS = [
+    {"ea": 0x140030010, "name": "dword_140030010", "size": 4, "cur_type": "", "nxrefs": 3},
+    {"ea": 0x140030020, "name": "off_140030020",   "size": 8, "cur_type": "", "nxrefs": 1},
+]
+# top-K best-understood referencing functions per global (already ranked)
+_DEMO_GLOBAL_SITES = {
+    0x140030010: [
+        {"func_ea": 0x140001000, "func_name": "GameManager$$Update",
+         "proto": "void GameManager__Update(GameManager *this, float dt)",
+         "access": ["read", "write"],
+         "snippet": "if ( dword_140030010 < 4 )\n    ++dword_140030010;"},
+        {"func_ea": 0x140001100, "func_name": "Player$$TakeDamage",
+         "proto": "void Player__TakeDamage(Entity *this, float amount)",
+         "access": ["read"], "snippet": "return dword_140030010;"},
+    ],
+}
+_DEMO_GLOBAL_NAMES = {0x140030010: ("g_player_count", "int")}
+_demo_global_state: dict[int, dict] = {}
+
+
+def list_globals(min_xrefs: int = 1) -> list[dict]:
+    return [dict(g) for g in _DEMO_GLOBALS if g["nxrefs"] >= min_xrefs]
+
+
+def global_context(addr, top_k: int = 5) -> dict:
+    ea = _norm(addr)
+    g = next((x for x in _DEMO_GLOBALS if x["ea"] == ea), None)
+    sites = _DEMO_GLOBAL_SITES.get(ea, [])
+    return {"ea": ea, "name": g["name"] if g else hex(ea),
+            "size": g["size"] if g else 0, "cur_type": g["cur_type"] if g else "",
+            "nrefs": len(sites), "sites": [dict(s) for s in sites[:top_k]]}
+
+
+def name_global(global_info: dict, sites: list[dict], glossary: str = "") -> dict:
+    ea = _norm(global_info.get("ea", 0)) if global_info.get("ea") else 0
+    nm, ty = _DEMO_GLOBAL_NAMES.get(ea, ("g_global_%X" % ea, "int"))
+    return {"name": nm, "type": ty, "reason": "demo global naming"}
+
+
+def set_global(addr, name: str, type_str: str = "") -> dict:
+    ea = _norm(addr)
+    named = ""; typed = False; dropped: list[dict] = []
+    if name and name.isidentifier():
+        named = name
+        _demo_global_state.setdefault(ea, {})["name"] = name
+    if type_str:
+        reason = _demo_classify_type(type_str)
+        if reason:
+            dropped.append({"var": named or name or hex(ea), "type": type_str, "reason": reason})
+        else:
+            typed = True
+            _demo_global_state.setdefault(ea, {})["type"] = type_str
+    return {"named": named, "typed": typed, "dropped": dropped}
+
+
 def rename_lvars(addr, names: dict, ret_type: str = "") -> dict:
     st = _demo_state(_norm(addr))
     code = st["pseudocode"]

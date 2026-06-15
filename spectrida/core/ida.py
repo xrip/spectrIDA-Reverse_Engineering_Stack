@@ -128,6 +128,27 @@ def _classify_type(type_str):
         return (None, "parse_failed")
     return (tif, "")
 
+# Mirror of spectrida.core.globals — generic-data placeholder names + the
+# referencing-function quality weighting (keep in sync with that tested module).
+_GENERIC_DATA_RE = _re_t.compile(
+    r"^(?:dword|qword|word|byte|off|unk|stru|asc|xmmword|ymmword|flt|dbl|"
+    r"packreal|tbyte)_[0-9A-Fa-f]+$")
+
+def _is_generic_global(nm):
+    return bool(_GENERIC_DATA_RE.match(nm or ""))
+
+def _fn_quality(m):
+    s = 0.0
+    if m.get("named"): s += 5.0
+    if m.get("typed_proto"): s += 3.0
+    s += 1.5 * min(m.get("napis", 0), 6)
+    s += 1.0 * min(m.get("nstrings", 0), 6)
+    s += 0.8 * min(m.get("nnamed_callees", 0), 8)
+    sz = m.get("size", 0) or 0
+    if sz > 4000: s -= 2.0
+    elif sz > 1500: s -= 0.5
+    return s
+
 def _norm_ty(s):
     return _re_t.sub(r"\s+", "", s or "")
 
@@ -575,6 +596,156 @@ for line in sys.stdin:
                                              "dropped": pd.get("dropped", [])}})
             except Exception as e:
                 emit({"ok": False, "error": "apply_struct: %s" % e})
+        elif cmd == "list_globals":
+            # G — enumerate generic data placeholders (dword_*, byte_*, off_*, …)
+            # that have ≥min_xrefs code references; rank/leverage decided host-side.
+            # NOTE: idautils.Names() does NOT include auto-generated "dummy" names
+            # (dword_*, byte_*, … are exactly those), so we walk the heads of the
+            # data segments and read each item's (possibly dummy) name directly.
+            try:
+                lim = int(a.get("limit", 20000)); minx = int(a.get("min_xrefs", 1))
+                out = []
+                _CODE = getattr(idaapi, "SEG_CODE", 2)
+                for seg_ea in idautils.Segments():
+                    seg = idaapi.getseg(seg_ea)
+                    if not seg or seg.type == _CODE:
+                        continue
+                    for head in idautils.Heads(seg.start_ea, seg.end_ea):
+                        # only data items, not code that slipped into a data seg
+                        if idc.is_code(idc.get_full_flags(head)):
+                            continue
+                        nm = idc.get_name(head) or ""
+                        if not _is_generic_global(nm):
+                            continue
+                        # full code-xref count drives host-side ranking by leverage
+                        nx = sum(1 for xr in idautils.XrefsTo(head, 0)
+                                 if idaapi.get_func(xr.frm) is not None)
+                        if nx < minx:
+                            continue
+                        try: sz = int(idc.get_item_size(head))
+                        except Exception: sz = 0
+                        try: ct = idc.get_type(head) or ""
+                        except Exception: ct = ""
+                        out.append({"ea": head, "name": nm, "size": sz,
+                                    "cur_type": ct, "nxrefs": nx})
+                        if len(out) >= lim:
+                            break
+                    if len(out) >= lim:
+                        break
+                emit({"ok": True, "result": out})
+            except Exception as e:
+                emit({"ok": False, "error": "list_globals: %s" % e})
+        elif cmd == "global_context":
+            # G — for one global, find its referencing functions, rank them by
+            # analysis quality (named/typed/signal-rich), and return the top-K with
+            # a windowed pseudocode snippet + access kind (read/write/address-taken).
+            try:
+                import ida_hexrays
+                gea = _norm(a["address"]); top_k = int(a.get("top_k", 5))
+                gname = idc.get_name(gea) or hex(gea)
+                seen = {}
+                for xr in idautils.XrefsTo(gea, 0):
+                    fn = idaapi.get_func(xr.frm)
+                    if not fn or fn.start_ea in seen:
+                        continue
+                    fea = fn.start_ea
+                    fnm = idc.get_func_name(fea) or hex(fea)
+                    named = not (fnm.startswith("sub_") or fnm.startswith("j_")
+                                 or fnm.startswith("nullsub_"))
+                    proto = _proto(fea)
+                    napis = 0; nnamed_callees = 0
+                    for ea2 in idautils.FuncItems(fea):
+                        for cr in idautils.CodeRefsFrom(ea2, 0):
+                            tf = idaapi.get_func(cr)
+                            cnm = idc.get_func_name(cr) or ""
+                            if tf is None or (tf.flags & idaapi.FUNC_THUNK):
+                                if cnm and not cnm.startswith("sub_"):
+                                    napis += 1
+                            elif cnm and not cnm.startswith("sub_") and tf.start_ea != fea:
+                                nnamed_callees += 1
+                    seen[fea] = {"func_ea": fea, "func_name": fnm, "proto": proto,
+                                 "named": named, "typed_proto": bool(proto and "(" in proto),
+                                 "napis": napis, "nnamed_callees": nnamed_callees,
+                                 "size": fn.size()}
+                cands = sorted(seen.values(),
+                               key=lambda m: (-_fn_quality(m), -m["size"], m["func_ea"]))
+                sites = []
+                for m in cands[:top_k]:
+                    snippet = ""; access = set()
+                    try:
+                        cf = idaapi.decompile(m["func_ea"])
+                    except Exception:
+                        cf = None
+                    if cf:
+                        keep = [ln for ln in str(cf).splitlines()
+                                if _re_t.search(r"\b%s\b" % _re_t.escape(gname), ln)]
+                        snippet = "\n".join(keep[:12])
+                        class _GV(ida_hexrays.ctree_visitor_t):
+                            def __init__(self):
+                                ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+                            def visit_expr(self, e):
+                                try:
+                                    if e.op == ida_hexrays.cot_asg and e.x is not None:
+                                        t = e.x
+                                        while t is not None and t.op == ida_hexrays.cot_cast:
+                                            t = t.x
+                                        if t is not None and t.op == ida_hexrays.cot_obj and t.obj_ea == gea:
+                                            access.add("write")
+                                    if e.op == ida_hexrays.cot_obj and e.obj_ea == gea:
+                                        access.add("read")
+                                    if (e.op == ida_hexrays.cot_ref and e.x is not None
+                                            and e.x.op == ida_hexrays.cot_obj and e.x.obj_ea == gea):
+                                        access.add("address-taken")
+                                except Exception:
+                                    pass
+                                return 0
+                        try: _GV().apply_to(cf.body, None)
+                        except Exception: pass
+                    sites.append({"func_ea": m["func_ea"], "func_name": m["func_name"],
+                                  "proto": m["proto"], "snippet": snippet,
+                                  "access": sorted(access) or ["read"]})
+                try: gsz = int(idc.get_item_size(gea))
+                except Exception: gsz = 0
+                emit({"ok": True, "result": {"ea": gea, "name": gname, "size": gsz,
+                                             "cur_type": idc.get_type(gea) or "",
+                                             "nrefs": len(cands), "sites": sites}})
+            except Exception as e:
+                emit({"ok": False, "error": "global_context: %s" % e})
+        elif cmd == "set_global":
+            # G — name + type a global. Name first, then type (IDA splits the two);
+            # type is validated + read-back verified (E), failures returned, never
+            # silently dropped. Existing non-generic type is not clobbered.
+            try:
+                import ida_typeinf
+                gea = _norm(a["address"]); nm = a.get("name", ""); ty = a.get("type", "")
+                named = ""; typed = False; dropped = []
+                if nm and nm.isidentifier():
+                    use = nm
+                    _ex = idc.get_name_ea_simple(use)
+                    if _ex != idc.BADADDR and _ex != gea:
+                        for _i in range(1, 100):
+                            _c = "%s_%d" % (nm, _i)
+                            if idc.get_name_ea_simple(_c) == idc.BADADDR:
+                                use = _c; break
+                    if idc.set_name(gea, use, idc.SN_NOWARN | idc.SN_NOCHECK):
+                        named = use
+                if ty:
+                    tif, reason = _classify_type(ty)
+                    if tif is None:
+                        dropped.append({"var": named or nm or hex(gea), "type": ty, "reason": reason})
+                    else:
+                        ok = ida_typeinf.apply_tinfo(gea, tif, ida_typeinf.TINFO_DEFINITE)
+                        chk = ida_typeinf.tinfo_t()
+                        if ok and idaapi.get_tinfo(chk, gea) and _ty_match(str(chk), ty):
+                            typed = True
+                        else:
+                            dropped.append({"var": named or nm or hex(gea), "type": ty,
+                                            "reason": "verify_mismatch"})
+                if named or typed:
+                    idc.save_database("")
+                emit({"ok": True, "result": {"named": named, "typed": typed, "dropped": dropped}})
+            except Exception as e:
+                emit({"ok": False, "error": "set_global: %s" % e})
         elif cmd == "func_meta":
             # extra naming hints: compact RE facts that help the model name and type
             # the function without dumping unbounded disassembly into the prompt.
@@ -1254,6 +1425,35 @@ async def apply_struct(ida: IDAHandle, address: str | int, arg_index: int,
                               arg_index=arg_index, type=type_str)
     except Exception:
         return {"applied": False, "dropped": []}
+
+
+async def list_globals(ida: IDAHandle, min_xrefs: int = 1, limit: int = 5000) -> list[dict]:
+    """Enumerate generic data placeholders (dword_*, byte_*, …) with ≥min_xrefs
+    code references. Each: {ea, name, size, cur_type, nxrefs}."""
+    try:
+        return await ida.call("list_globals", min_xrefs=min_xrefs, limit=limit)
+    except Exception:
+        return []
+
+
+async def global_context(ida: IDAHandle, address: str | int, top_k: int = 5) -> dict:
+    """Top-K best-understood referencing functions for a global, with snippets +
+    access kinds. Returns {ea, name, size, cur_type, nrefs, sites: [...]}."""
+    try:
+        return await ida.call("global_context", address=_hex(address), top_k=top_k)
+    except Exception:
+        return {"ea": 0, "name": "", "size": 0, "cur_type": "", "nrefs": 0, "sites": []}
+
+
+async def set_global(ida: IDAHandle, address: str | int, name: str,
+                     type_str: str = "") -> dict:
+    """Name + type a global (name first, then type — validated + read-back). Returns
+    {"named": actual_name|"", "typed": bool, "dropped": [...]}."""
+    try:
+        return await ida.call("set_global", address=_hex(address),
+                              name=name, type=type_str)
+    except Exception:
+        return {"named": "", "typed": False, "dropped": []}
 
 
 def _hex(address: str | int) -> str:

@@ -36,6 +36,10 @@ class Backend:
     async def make_struct(self, name: str, decl: str) -> dict: ...
     async def apply_struct(self, addr, arg_index: int, type_str: str) -> dict: ...
     async def name_struct(self, layout: list[dict], snippets: str, glossary: str = "") -> dict: ...
+    async def list_globals(self, min_xrefs: int = 1) -> list[dict]: ...
+    async def global_context(self, ea, top_k: int = 5) -> dict: ...
+    async def set_global(self, ea, name: str, type_str: str = "") -> dict: ...
+    async def name_global(self, global_info: dict, sites: list[dict], glossary: str = "") -> dict: ...
     async def name_variables(self, pseudocode: str, lvars: list[dict]) -> dict: ...
     async def correct_types(self, pseudocode: str, failed: list[dict]) -> dict: ...
     async def name_function_staged(self, pseudocode, lvars, callees, callers,
@@ -108,6 +112,18 @@ class RealBackend(Backend):
 
     async def name_struct(self, layout, snippets, glossary=""):
         return await _llamacpp.name_struct(layout, snippets, glossary=glossary)
+
+    async def list_globals(self, min_xrefs=1):
+        return await _ida.list_globals(self._ida, min_xrefs)
+
+    async def global_context(self, ea, top_k=5):
+        return await _ida.global_context(self._ida, ea, top_k)
+
+    async def set_global(self, ea, name, type_str=""):
+        return await _ida.set_global(self._ida, ea, name, type_str)
+
+    async def name_global(self, global_info, sites, glossary=""):
+        return await _llamacpp.name_global(global_info, sites, glossary=glossary)
 
     async def name_variables(self, pseudocode, lvars):
         return await _llamacpp.name_variables(pseudocode, lvars)
@@ -183,6 +199,18 @@ class DemoBackend(Backend):
 
     async def name_struct(self, layout, snippets, glossary=""):
         return _demo.name_struct(layout, snippets, glossary=glossary)
+
+    async def list_globals(self, min_xrefs=1):
+        return _demo.list_globals(min_xrefs)
+
+    async def global_context(self, ea, top_k=5):
+        return _demo.global_context(ea, top_k)
+
+    async def set_global(self, ea, name, type_str=""):
+        return _demo.set_global(ea, name, type_str)
+
+    async def name_global(self, global_info, sites, glossary=""):
+        return _demo.name_global(global_info, sites, glossary=glossary)
 
     async def name_variables(self, pseudocode, lvars):
         return _demo.name_variables(pseudocode, lvars)

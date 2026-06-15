@@ -578,6 +578,56 @@ async def name_struct(layout: list[dict], snippets: str, *,
             "reason": reason if isinstance(reason, str) else ""}
 
 
+async def name_global(global_info: dict, sites: list[dict], *,
+                      glossary: str = "") -> dict:
+    """Name + type a global variable (G — global naming) from its best-understood
+    use sites.
+
+    *global_info* = {name, size, cur_type}. *sites* = the top-K referencing
+    functions, each {func_name, proto, access, snippet}. Returns
+    ``{"name": str, "type": str, "reason": str}``; the host validates the type in
+    IDA and drops it (without renaming) if it doesn't apply.
+    """
+    if not sites:
+        return {"name": "", "type": "", "reason": ""}
+    blocks = []
+    for s in sites[:8]:
+        acc = ", ".join(s.get("access") or []) or "read"
+        head = s.get("proto") or s.get("func_name") or hex(s.get("func_ea", 0))
+        snippet = (s.get("snippet") or "").strip()
+        blocks.append("In %s  [%s]:\n%s" % (head, acc, snippet[:800]))
+    sites_block = "\n\n".join(blocks)
+    g = global_info or {}
+    user_msg = (
+        (f"{glossary}\n\n" if glossary else "")
+        + "Name and type a GLOBAL variable from how the best-understood functions "
+        "use it. Current name %r, size %s bytes, current type %r.\n\n"
+        % (g.get("name", ""), g.get("size", 0), g.get("cur_type", "") or "unknown")
+        + "Use sites (most informative first):\n%s\n\n" % sites_block
+        + "Give a descriptive snake_case name (prefix g_ for a mutable global, "
+        "k_ / no prefix for a const table) and a concrete C type consistent with "
+        "the size and usage. Prefer an existing struct/enum from this binary over a "
+        "bare scalar; if the evidence is one-sided, fall back to a size-matched "
+        "scalar (e.g. int for 4 bytes). Do NOT invent a struct that isn't in the "
+        "binary.\n"
+        'Reply ONLY with JSON: {"name": "g_player_count", "type": "int", '
+        '"reason": "one sentence"}'
+    )
+    raw = await _stream_chat([
+        {"role": "system", "content": _build_system()},
+        {"role": "user",   "content": user_msg},
+    ], json_mode=llm_json_mode())
+    obj = extract_json_object(raw)
+    name = obj.get("name") or ""
+    if not (isinstance(name, str) and name.isidentifier()):
+        name = ""
+    ty = obj.get("type") or obj.get("c_type") or ""
+    reason = obj.get("reason") or obj.get("reasoning") or ""
+    return {"name": name,
+            "type": ty.strip() if isinstance(ty, str) else "",
+            "reason": reason if isinstance(reason, str) else ""}
+
+
 async def name_variables(pseudocode: str, lvars: list[dict]) -> dict[str, str]:
     """Ask the model for a {old_name: {name, type}} mapping for locals + params."""
     if not lvars:
