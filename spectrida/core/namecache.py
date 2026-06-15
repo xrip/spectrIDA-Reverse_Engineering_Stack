@@ -56,6 +56,31 @@ def key(pseudocode: str, callees: list[str] | None, callers: list[str] | None,
     return hashlib.sha1("\x00".join(parts).encode("utf-8", "replace")).hexdigest()
 
 
+def key_global(global_info: dict, sites: list[dict] | None) -> str:
+    """Stable content hash for a global's naming inputs (G).
+
+    Keyed by the global's size + current type plus its ranked use sites
+    (referencing function name + access kind + normalized snippet) — NOT its
+    address — so re-running an unchanged binary is a cache hit, while a change in
+    how the global is used (e.g. once neighbouring functions get named) re-keys and
+    re-evaluates. Namespaced with a ``g:`` prefix so it can't collide with the
+    function-naming keys in the same store.
+    """
+    g = global_info or {}
+    site_parts = []
+    for s in (sites or []):
+        snip = normalize_code(s.get("snippet", "") or "")
+        acc = ",".join(sorted(s.get("access") or []))
+        fn = s.get("func_name", "") or ""
+        site_parts.append(f"{fn}#{acc}#{snip}")
+    parts = [
+        str(g.get("size", 0)),
+        normalize_code(g.get("cur_type", "") or ""),
+        "|".join(sorted(site_parts)),
+    ]
+    return "g:" + hashlib.sha1("\x00".join(parts).encode("utf-8", "replace")).hexdigest()
+
+
 class NameCache:
     """key → {"name", "ret_type", "variables"}. JSON-persisted."""
 
@@ -84,6 +109,18 @@ class NameCache:
             "ret_type": staged.get("ret_type", "") or "",
             "variables": staged.get("variables", {}) or {},
         }
+        self._dirty += 1
+
+    def put_global(self, k: str, staged: dict) -> None:
+        """Cache a global naming result ``{name, type}`` (G). Stored under the
+        ``g:``-prefixed key from :func:`key_global`."""
+        if not self.enabled:
+            return
+        name = staged.get("name", "") or ""
+        ty = staged.get("type", "") or ""
+        if not name and not ty:     # never cache a non-result
+            return
+        self._d[k] = {"name": name, "type": ty}
         self._dirty += 1
 
     # ── persistence ───────────────────────────────────────────────────────────

@@ -213,6 +213,15 @@ def struct_recovery_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def name_lint_enabled() -> bool:
+    """Canonicalise function names across the binary — unify equivalent tokens to
+    the corpus's most-used form and fix typos (default ON). Disable with
+    SPECTRIDA_NAME_LINT=0.
+    """
+    raw = get("pipeline", "name_lint", "SPECTRIDA_NAME_LINT").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def global_naming_enabled() -> bool:
     """Name + type generic globals (dword_*, byte_*, …) from their best use sites
     (default ON). Disable with SPECTRIDA_GLOBAL_NAMING=0.

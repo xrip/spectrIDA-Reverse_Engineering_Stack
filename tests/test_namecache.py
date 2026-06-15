@@ -2,7 +2,7 @@
 import asyncio
 
 from spectrida.core import namecache
-from spectrida.core.namecache import NameCache, key, normalize_code
+from spectrida.core.namecache import NameCache, key, key_global, normalize_code
 from spectrida.core import demo
 from spectrida.api import open_demo
 from spectrida.core.demo import FUNCTIONS
@@ -37,6 +37,30 @@ def test_cache_get_put_and_disabled():
     off = NameCache(enabled=False)
     off.put("k", {"name": "x"})
     assert off.get("k") is None
+
+
+def test_key_global_namespaced_and_stable():
+    gi = {"size": 4, "cur_type": ""}
+    sites = [{"func_name": "GameManager__Update", "access": ["read", "write"],
+              "snippet": "if ( dword_140030010 < 4 ) ++dword_140030010;"}]
+    k1 = key_global(gi, sites)
+    k2 = key_global(dict(gi), [dict(sites[0])])
+    assert k1 == k2                                   # stable for identical input
+    assert k1.startswith("g:")                        # namespaced vs function keys
+    # a changed use site re-keys
+    sites2 = [{"func_name": "Other__Func", "access": ["read"], "snippet": "x"}]
+    assert key_global(gi, sites2) != k1
+
+
+def test_put_global_roundtrip(tmp_path):
+    c = NameCache()
+    c.put_global("g:abc", {"name": "g_player_count", "type": "int"})
+    assert c.get("g:abc") == {"name": "g_player_count", "type": "int"}
+    c.put_global("g:empty", {"name": "", "type": ""})    # non-result not stored
+    assert c.get("g:empty") is None
+    p = str(tmp_path / "names.json")
+    c.save(p)
+    assert NameCache().load(p).get("g:abc")["name"] == "g_player_count"
 
 
 def test_save_load_roundtrip(tmp_path):

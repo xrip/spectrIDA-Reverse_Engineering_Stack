@@ -72,6 +72,7 @@ class HelpScreen(ModalScreen[None]):
         ("T", "deep-name this call branch (bottom-up; re-types already-named funcs)"),
         ("F", "recover structs from field accesses, apply to pointer params"),
         ("G", "name + type generic globals (dword_*, …) from their use sites"),
+        ("L", "lint — unify naming across the binary (msg/message, typos, …)"),
         ("O", "overview — AI summary of the whole binary"),
         ("[ / ]", "scroll the report pane (mouse wheel works too)"),
         ("/", "fuzzy search"),

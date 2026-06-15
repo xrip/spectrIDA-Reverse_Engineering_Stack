@@ -25,11 +25,13 @@ from typing import TypedDict
 from spectrida.config import (
     global_naming_enabled,
     name_cache_enabled,
+    name_lint_enabled,
     struct_recovery_enabled,
     type_propagation_enabled,
     type_retry_enabled,
 )
 from spectrida.core import namecache
+from spectrida.core.canon import build_preferences, canonical_name
 from spectrida.core.globals import rank_globals
 from spectrida.core.structs import (
     merge_field_names,
@@ -709,6 +711,7 @@ class IDADatabase:
         min_xrefs: int = 2,
         limit: int = 100_000,
         rename: bool = True,
+        use_cache: bool = True,
         progress_cb=None,
     ) -> dict:
         """Name + type generic globals (``dword_*``, ``byte_*``, ``off_*``, …) from
@@ -736,6 +739,7 @@ class IDADatabase:
         ranked = rank_globals([g for g in raw
                                if int(g.get("nxrefs", 0)) >= min_xrefs])[:limit]
         await self._ensure_glossary_seed()
+        await self._ensure_cache_loaded()
 
         total = len(ranked)
         # phase callbacks let the UI explain the (slow) per-global analysis:
@@ -754,9 +758,19 @@ class IDADatabase:
                     await progress_cb(gi + 1, total, {"phase": "skip", "name": gname,
                                                       "nxrefs": nx, "reason": "no use sites"})
                 continue
-            staged = await self._b.name_global(
-                ctx, sites, glossary=self._glossary.render())
-            nm = staged.get("name", ""); ty = staged.get("type", "")
+            # content-addressed cache: identical use-site shape on an unchanged
+            # binary → reuse the prior name/type, no LLM round-trip.
+            gk = namecache.key_global(ctx, sites)
+            cached = self._cache.get(gk) if use_cache else None
+            cache_hit = cached is not None
+            if cache_hit:
+                nm = cached.get("name", ""); ty = cached.get("type", "")
+            else:
+                staged = await self._b.name_global(
+                    ctx, sites, glossary=self._glossary.render())
+                nm = staged.get("name", ""); ty = staged.get("type", "")
+                self._cache.put_global(gk, {"name": nm, "type": ty})
+                self._cache.maybe_save()
             if not nm and not ty:
                 if progress_cb:
                     await progress_cb(gi + 1, total, {"phase": "skip", "name": gname,
@@ -781,8 +795,61 @@ class IDADatabase:
                 await progress_cb(gi + 1, total, {
                     "phase": "done", "name": applied_name or nm, "type": ty,
                     "old_name": gname, "nxrefs": nx, "sites": len(sites),
-                    "dropped": dropped, "reason": staged.get("reason", ""),
+                    "dropped": dropped, "source": "cache" if cache_hit else "model",
                 })
+        return totals
+
+    # ── name canonicalisation linter (C) ──────────────────────────────────────
+
+    async def canonicalize_names(
+        self,
+        *,
+        scope: str = "named",
+        rename: bool = True,
+        progress_cb=None,
+    ) -> dict:
+        """Lint + unify function names across the binary for consistency.
+
+        Equivalent tokens (``message``/``msg``, ``receive``/``recv``, …) are
+        unified to the form THIS binary already uses most (data-driven — nothing is
+        imposed unless the binary is already inconsistent), and always-wrong
+        spellings are fixed. Only multi-token snake_case names are rewritten;
+        library/runtime/class names are left untouched (see ``core.canon``).
+
+        Generic, meaningless names are *reported* (``reason="generic"``) but never
+        auto-renamed — there's no safe target.
+
+        Returns ``{"checked", "flagged", "renamed", "generic"}``.
+        """
+        funcs = await self.list_functions()
+        named = [f for f in funcs if not f["name"].lower().startswith("sub_")]
+        names = [f["name"] for f in named]
+        prefs = build_preferences(names)
+
+        totals = {"checked": len(named), "flagged": 0, "renamed": 0, "generic": 0}
+        do_rename = rename and name_lint_enabled()
+        total = len(named)
+        for i, f in enumerate(named):
+            cur = f["name"]
+            sug = canonical_name(cur, prefs)
+            info = {"current": cur, "suggested": "", "reason": "", "applied": False,
+                    "addr": f["start"]}
+            if sug != cur:
+                totals["flagged"] += 1
+                info["suggested"] = sug
+                info["reason"] = "normalize"
+                if do_rename:
+                    actual = await self.rename(f["start"], sug)
+                    applied = actual if isinstance(actual, str) else (sug if actual else "")
+                    if applied:
+                        totals["renamed"] += 1
+                        info["applied"] = True
+                        info["suggested"] = applied   # may differ if deduped
+            elif cur.lower() in _GENERIC_NAMES:
+                totals["generic"] += 1
+                info["reason"] = "generic"
+            if progress_cb and info["reason"]:
+                await progress_cb(i + 1, total, info)
         return totals
 
     async def name_branch(
@@ -1203,6 +1270,19 @@ class IDADatabase:
             raise ValueError(f"unknown format {fmt!r} — use json, csv, idc, or symbols")
 
         return out
+
+    def save_cache(self) -> None:
+        """Flush the naming cache to disk WITHOUT closing the backend.
+
+        The TUI keeps one long-lived IDADatabase and never calls close() (the
+        backend outlives any single action), so it calls this after each AI action
+        to persist newly-cached names instead of relying on the periodic
+        ``maybe_save`` threshold or the close-time save it never reaches.
+        """
+        try:
+            self._cache.save()
+        except Exception:
+            pass
 
     async def close(self) -> None:
         try:

@@ -156,6 +156,7 @@ class BrowserScreen(Screen):
         Binding("t", "deep_branch", "Deep"),
         Binding("f", "recover_structs", "Structs"),
         Binding("g", "name_globals", "Globals"),
+        Binding("l", "canonicalize", "Lint"),
         Binding("o", "overview", "Overview"),
         Binding("bracketright", "scroll_report_down", "Report▼", show=False),
         Binding("bracketleft", "scroll_report_up", "Report▲", show=False),
@@ -175,6 +176,31 @@ class BrowserScreen(Screen):
         self._suggested: str | None = None
         self._decompiled = False
         self._busy = False
+        self._db = None   # one long-lived IDADatabase → shared name cache + glossary
+
+    def _database(self):
+        """Return the screen's single IDADatabase, created on first use.
+
+        Sharing one instance across every action means the content-addressed name
+        cache and the project glossary accumulate over the whole session (a `B`
+        sweep warms the cache that `G`/`T`/`V` then reuse) instead of each action
+        starting cold with a throwaway instance.
+        """
+        if self._db is None:
+            from spectrida.api import IDADatabase
+            self._db = IDADatabase(self._b)
+        return self._db
+
+    def _flush_cache(self) -> None:
+        """Persist newly-cached names to disk after an action (the TUI never
+        close()s the long-lived db, so we flush explicitly)."""
+        if self._db is not None:
+            self._db.save_cache()
+
+    def on_unmount(self) -> None:
+        # final flush when leaving the browser (covers entries below the periodic
+        # maybe_save threshold)
+        self._flush_cache()
 
     def compose(self) -> ComposeResult:
         tag = " demo" if self._b.demo else ""
@@ -362,7 +388,6 @@ class BrowserScreen(Screen):
         self._spawn(self._name_vars())
 
     async def _name_vars(self) -> None:
-        from spectrida.api import IDADatabase
         spin = self.query_one("#model-spinner", Static)
         res  = self.query_one("#model-result", Static)
         rsn  = self.query_one("#model-reason", Static)
@@ -371,7 +396,7 @@ class BrowserScreen(Screen):
         rsn.update("")
         spin.update("  ▸ staged: name → params → locals + return…")
         try:
-            db = IDADatabase(self._b)
+            db = self._database()
             # staged conversation for context, but DON'T commit the function rename
             result = await db.name_all(self._cur["start"], rename=True, rename_function=False)
             spin.update("")
@@ -402,6 +427,7 @@ class BrowserScreen(Screen):
             res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")
         finally:
             self._busy = False
+            self._flush_cache()
 
     # ── rename ──
     def action_rename_func(self) -> None:
@@ -417,7 +443,9 @@ class BrowserScreen(Screen):
             self._spawn(self._do_rename(new_name))
 
     async def _do_rename(self, new_name: str) -> None:
-        result = await self._b.rename(self._cur["start"], new_name)
+        # route through the shared db so its cached function list (used for
+        # old-name lookups / glossary seeding) stays in sync with manual renames
+        result = await self._database().rename(self._cur["start"], new_name)
         actual = result if isinstance(result, str) else (new_name if result else "")
         if actual:
             self._cur["name"] = actual   # same dict FuncList holds → mutates in place
@@ -455,8 +483,7 @@ class BrowserScreen(Screen):
         self.query_one("#model-hint", Static).update("")
         spin.update(mapping_msg)
         try:
-            from spectrida.api import IDADatabase
-            db = IDADatabase(self._b)
+            db = self._database()
             state = {"named": 0, "skipped": 0, "vars": 0, "typed": 0, "dropped": 0}
             tree: list[dict] = []
             cur_idx = [0]
@@ -495,6 +522,7 @@ class BrowserScreen(Screen):
             res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")
         finally:
             self._busy = False
+            self._flush_cache()
             try:
                 self.query_one(StatusBar).clear_progress()
             except Exception:
@@ -610,8 +638,7 @@ class BrowserScreen(Screen):
         spin = self.query_one("#model-spinner", Static)
         spin.update("  ▸ mapping call branch…")
         try:
-            from spectrida.api import IDADatabase
-            db = IDADatabase(self._b)
+            db = self._database()
             root = self._cur["start"]
             state = {"named": 0, "skipped": 0, "vars": 0, "typed": 0, "dropped": 0}
 
@@ -648,6 +675,7 @@ class BrowserScreen(Screen):
             res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")
         finally:
             self._busy = False
+            self._flush_cache()
             try:
                 self.query_one(StatusBar).clear_progress()
             except Exception:
@@ -673,8 +701,7 @@ class BrowserScreen(Screen):
         spin.update("  ▸ scanning functions for recoverable structs…")
         log: list[str] = []
         try:
-            from spectrida.api import IDADatabase
-            db = IDADatabase(self._b)
+            db = self._database()
 
             async def progress_cb(done: int, total: int, info: dict) -> None:
                 fn = (info.get("func") or "")[:26]
@@ -721,6 +748,7 @@ class BrowserScreen(Screen):
             res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")
         finally:
             self._busy = False
+            self._flush_cache()
             try:
                 self.query_one(StatusBar).clear_progress()
             except Exception:
@@ -752,8 +780,7 @@ class BrowserScreen(Screen):
         spin.update(f"  ▸ enumerating generic globals (≥{min_xrefs} xrefs)…")
         log: list[str] = []
         try:
-            from spectrida.api import IDADatabase
-            db = IDADatabase(self._b)
+            db = self._database()
 
             async def progress_cb(done: int, total: int, info: dict) -> None:
                 phase = info.get("phase")
@@ -777,10 +804,11 @@ class BrowserScreen(Screen):
                     tpart = f" : [magenta]{ty}[/]" if ty else ""
                     drop = (f" · [red]{len(info['dropped'])} dropped[/]"
                             if info.get("dropped") else "")
+                    cache = " [dim cyan](cache)[/]" if info.get("source") == "cache" else ""
                     log.append(f"  [dim]{info.get('old_name', '')}[/] → "
                                f"[b green]{info.get('name', '')}[/]{tpart} "
                                f"[dim]({info.get('nxrefs', 0)} xrefs, "
-                               f"{info.get('sites', 0)} sites)[/]{drop}")
+                               f"{info.get('sites', 0)} sites)[/]{cache}{drop}")
                 rsn.update("\n".join(log[-40:]))
 
             totals = await db.name_globals(min_xrefs=min_xrefs, progress_cb=progress_cb)
@@ -801,17 +829,83 @@ class BrowserScreen(Screen):
             res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")
         finally:
             self._busy = False
+            self._flush_cache()
+            try:
+                self.query_one(StatusBar).clear_progress()
+            except Exception:
+                pass
+
+    # ── name canonicalisation linter (unify naming across the binary) ──
+    def action_canonicalize(self) -> None:
+        if self._busy:
+            self.notify("still working — wait a moment", severity="warning")
+            return
+        self._spawn(self._canonicalize())
+
+    async def _canonicalize(self) -> None:
+        """Unify function names across the binary (token/typo canonicalisation)."""
+        self._busy = True
+        fl   = self.query_one("#func-list", FuncList)
+        by_addr = {f["start"]: f for f in fl._all}
+        res  = self.query_one("#model-result", Static)
+        rsn  = self.query_one("#model-reason", Static)
+        bar  = self.query_one(StatusBar)
+        spin = self.query_one("#model-spinner", Static)
+        self.query_one("#model-hint", Static).update("")
+        rsn.update("")
+        spin.update("  ▸ linting names for consistency…")
+        log: list[str] = []
+        try:
+            db = self._database()
+
+            async def progress_cb(done: int, total: int, info: dict) -> None:
+                bar.set_progress(done, total, info.get("suggested") or info["current"])
+                if info["reason"] == "normalize":
+                    arrow = "✓" if info.get("applied") else "·"
+                    log.append(f"  [dim]{info['current']}[/] → "
+                               f"[b green]{info['suggested']}[/] [dim]{arrow}[/]")
+                    # keep the live list in sync when a rename actually happened
+                    if info.get("applied"):
+                        tgt = by_addr.get(info["addr"])
+                        if tgt:
+                            tgt["name"] = info["suggested"]
+                elif info["reason"] == "generic":
+                    log.append(f"  [yellow]{info['current']}[/] "
+                               f"[dim]— generic, rename by hand[/]")
+                spin.update(f"  ▸ lint {done}/{total} · {len(log)} flagged")
+                rsn.update("\n".join(log[-40:]))
+
+            totals = await db.canonicalize_names(progress_cb=progress_cb)
+            spin.update("")
+            gen = f", {totals['generic']} generic" if totals.get("generic") else ""
+            if not totals["flagged"] and not totals["generic"]:
+                res.update(f"  [dim]names already consistent — "
+                           f"{totals['checked']} checked, nothing to unify.[/]")
+            else:
+                res.update(f"  [b cyan]{totals['checked']}[/] checked · "
+                           f"[b green]{totals['renamed']}[/] unified · "
+                           f"[yellow]{totals['flagged']}[/] flagged{gen}  ·  "
+                           f"{voice.quip('naming_done')}")
+            fl.refresh()
+            self._refresh_func_count()
+            bar.set_info(f"{self._b.title} · lint — {totals['renamed']} unified, "
+                         f"{totals['flagged']} flagged{gen}")
+        except Exception as e:
+            spin.update("")
+            res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")
+        finally:
+            self._busy = False
+            self._flush_cache()
             try:
                 self.query_one(StatusBar).clear_progress()
             except Exception:
                 pass
 
     async def _do_overview(self) -> None:
-        from spectrida.api import IDADatabase
         screen = OverviewScreen("  asking the ghost…")
         self.app.push_screen(screen)
         try:
-            db = IDADatabase(self._b)
+            db = self._database()
             full = ""
             it = await db.overview(stream=True)
             async for tok in it:

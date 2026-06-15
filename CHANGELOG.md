@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Globals are cached too; the cache is actually persisted.** The
+  content-addressed name cache now stores **global** naming results
+  (`{name, type}`) keyed by the global's size/type + its ranked use sites
+  (`namecache.key_global`, `g:`-namespaced so it can't collide with function
+  keys) — re-running `G` on an unchanged binary reuses names with no LLM call
+  (shown as `(cache)` in the log). Pass `use_cache=False` to bypass.
+  **Efficiency fix:** the TUI used to build a throwaway `IDADatabase` per action,
+  each with its own empty cache + glossary, and never `close()`d it — so the
+  cache's final save never ran and nothing accumulated across actions. The
+  browser now keeps **one** long-lived database: the name cache and project
+  glossary build up over the whole session (a `B` sweep warms what `G`/`T`/`V`
+  reuse) and are flushed to disk after every action and on exit.
+- **Name canonicalisation linter (`L`).** Unifies function names across the whole
+  binary so the symbol set reads as one hand: equivalent tokens
+  (`message`/`msg`, `receive`/`recv`, `length`/`len`, …) are normalised to the
+  form **this binary already uses most** (data-driven — nothing is imposed unless
+  the binary is already inconsistent), and always-wrong spellings (`recieve`,
+  `lenght`, …) are fixed. Only multi-token snake_case names are rewritten;
+  single-token, library/runtime (`__chkstk`), class and mangled names are left
+  untouched (`spectrida/core/canon.py`, pure + tested). Generic, meaningless names
+  (`process`, `handler`, …) are *reported* but never auto-renamed. The MODEL pane
+  streams `old → new` proposals live. Kill switch `SPECTRIDA_NAME_LINT=0`.
 - **Global variable naming + typing (`G`).** Names and types the binary's generic
   globals (`dword_*`, `byte_*`, `off_*`, …) from how the **best-understood**
   functions use them. Each global is ranked by leverage (xref count); for each,

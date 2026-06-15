@@ -149,6 +149,51 @@ def test_name_globals_bad_type_dropped(monkeypatch):
     asyncio.run(run())
 
 
+def test_name_globals_uses_cache(monkeypatch):
+    async def run():
+        async with open_demo() as db:
+            calls = {"n": 0}
+            orig = demo.name_global
+
+            def counting(gi, sites, glossary=""):
+                calls["n"] += 1
+                return orig(gi, sites, glossary)
+            monkeypatch.setattr(demo, "name_global", counting)
+
+            await db.name_globals(min_xrefs=2)
+            first = calls["n"]
+            assert first >= 1
+            # second run over the same use-site shape → cache hit, no model call
+            sources = []
+
+            async def progress_cb(done, total, info):
+                if info.get("phase") == "done":
+                    sources.append(info.get("source"))
+
+            await db.name_globals(min_xrefs=2, progress_cb=progress_cb)
+            assert calls["n"] == first            # model not called again
+            assert "cache" in sources
+    asyncio.run(run())
+
+
+def test_name_globals_cache_bypass(monkeypatch):
+    async def run():
+        async with open_demo() as db:
+            calls = {"n": 0}
+            orig = demo.name_global
+
+            def counting(gi, sites, glossary=""):
+                calls["n"] += 1
+                return orig(gi, sites, glossary)
+            monkeypatch.setattr(demo, "name_global", counting)
+
+            await db.name_globals(min_xrefs=2)
+            first = calls["n"]
+            await db.name_globals(min_xrefs=2, use_cache=False)
+            assert calls["n"] > first             # bypass → model called again
+    asyncio.run(run())
+
+
 def test_name_globals_disabled(monkeypatch):
     monkeypatch.setenv("SPECTRIDA_GLOBAL_NAMING", "0")
 

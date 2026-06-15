@@ -1,9 +1,15 @@
 # Implementation Plan — Naming Uniformity & Typing Correctness (E + A + B)
 
-> **Status:** E ✅ · A ✅ · B ✅ · E-2 ✅ · H+I ✅ · D ✅ · F ✅ · G ✅ — done (81 tests green).
+> **Status:** E ✅ · A ✅ · B ✅ · E-2 ✅ · H+I ✅ · D ✅ · F ✅ · G ✅ · C ✅ — done (96 tests green).
 > Also added: scrollable TUI report pane (`[`/`]` + wheel).
-> Remaining (broader proposal, not yet built):
-> C (naming-canonicalization linter), disasm-path caching.
+> Remaining (broader proposal, not yet built): disasm-path caching.
+> C notes: pure `core/canon.py` — token equivalence groups + typo table; the
+> canonical form is **data-driven** (the corpus's most-frequent variant wins, so
+> nothing is imposed unless the binary is already inconsistent; typos always
+> fixed). Only multi-token snake_case names are rewritten (`is_lintable`) —
+> library/runtime/class/mangled names untouched. Driver `canonicalize_names`,
+> TUI key `L`, `SPECTRIDA_NAME_LINT` (default on). Generic names reported, never
+> auto-renamed.
 > G notes: quality scoring is pure (`core/globals.py` `function_quality` /
 > `rank_globals` / `is_generic_global`, mirrored inline in the worker). Worker
 > `list_globals` (generic-data names w/ ≥min_xrefs code refs) + `global_context`
