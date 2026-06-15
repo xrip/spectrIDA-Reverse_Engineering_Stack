@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Struct recovery re-harvests typed params reliably (`F` → incremental /
+  rebuild).** When a parameter is already typed as a recovered struct, its
+  accesses decompile as `a0->field`, and harvesting those under-collected — a
+  second `F` pass reported `too_few_fields` and refused to refine. Now, on
+  re-entry, the param's type is stripped to a raw pointer, the function is
+  re-decompiled (accesses come back as `*(T*)(a0+off)` — the reliable form),
+  evidence is harvested fully, and the merged struct re-applied. `F` now opens a
+  small chooser: **incremental** (generic pointers + refine our own structs) or
+  **rebuild** (re-derive EVERY struct pointer from code — use to repair structs a
+  previous run clobbered; re-derives all struct params, including ones not from our
+  recovery). The accumulated layout store makes both converge.
 - **Struct recovery now accumulates instead of clobbering.** Different functions
   dereference a struct at different offsets, so each recovery saw only a slice —
   and because they were redefined under the same model-chosen name, a later

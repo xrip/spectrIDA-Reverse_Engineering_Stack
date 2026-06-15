@@ -21,6 +21,7 @@ from spectrida.tui.screens.dialogs import (
     MinXrefsDialog,
     OverviewScreen,
     RenameDialog,
+    StructModeDialog,
 )
 from spectrida.tui.widgets.disasm import DisasmPane, is_sub
 from spectrida.tui.widgets.funclist import FuncList
@@ -687,11 +688,19 @@ class BrowserScreen(Screen):
         if self._busy:
             self.notify("still working — wait a moment", severity="warning")
             return
-        self._spawn(self._recover_structs())
+        self.app.push_screen(StructModeDialog(), self._after_struct_mode)
 
-    async def _recover_structs(self) -> None:
+    def _after_struct_mode(self, mode: str | None) -> None:
+        if mode is None:        # cancelled
+            return
+        self._spawn(self._recover_structs(rebuild=(mode == "rebuild")))
+
+    async def _recover_structs(self, rebuild: bool = False) -> None:
         """Recover C structs for generic pointer parameters across the binary and
-        apply them. Best run after the whole-binary naming sweep ('B')."""
+        apply them. Best run after the whole-binary naming sweep ('B').
+
+        rebuild: re-derive EVERY struct pointer from code (repairs structs that an
+        earlier run clobbered) instead of only generic pointers + our own structs."""
         self._busy = True
         res  = self.query_one("#model-result", Static)
         rsn  = self.query_one("#model-reason", Static)
@@ -699,7 +708,8 @@ class BrowserScreen(Screen):
         spin = self.query_one("#model-spinner", Static)
         self.query_one("#model-hint", Static).update("")
         rsn.update("")
-        spin.update("  ▸ scanning functions for recoverable structs…")
+        spin.update("  ▸ rebuilding every struct from code…" if rebuild
+                    else "  ▸ scanning functions for recoverable structs…")
         log: list[str] = []
         try:
             db = self._database()
@@ -733,7 +743,8 @@ class BrowserScreen(Screen):
                 if changed:
                     rsn.update("\n".join(log[-40:]))
 
-            totals = await db.recover_structs(scope="named", progress_cb=progress_cb)
+            totals = await db.recover_structs(scope="named", rebuild=rebuild,
+                                              progress_cb=progress_cb)
             spin.update("")
             drop = f", {totals['dropped']} dropped" if totals.get("dropped") else ""
             merged = f", {totals['merged']} merged" if totals.get("merged") else ""

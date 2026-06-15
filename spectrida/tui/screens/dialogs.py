@@ -58,6 +58,30 @@ class MinXrefsDialog(ModalScreen[int | None]):
         self.dismiss(max(1, n))
 
 
+class StructModeDialog(ModalScreen[str | None]):
+    """Pick how struct recovery should run. Returns "incremental", "rebuild", or
+    None on cancel."""
+    BINDINGS = [
+        Binding("i", "dismiss('incremental')", "incremental"),
+        Binding("r", "dismiss('rebuild')", "rebuild"),
+        Binding("escape", "dismiss(None)", "cancel"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rename-dialog"):
+            yield Label(" ⌗  recover structs", id="rename-title")
+            yield Static(
+                "  [b cyan]i[/]  incremental  — generic pointers + refine our own "
+                "recovered structs\n"
+                "  [b yellow]r[/]  rebuild     — re-derive EVERY struct pointer from "
+                "code\n"
+                "      [dim]use rebuild to repair structs clobbered by an earlier "
+                "run; it re-derives all struct params (incl. ones not from our "
+                "recovery)[/]",
+                id="help-body")
+            yield Label("i / r to choose   ·   esc cancel", id="dialog-hint")
+
+
 class HelpScreen(ModalScreen[None]):
     BINDINGS = [Binding("escape,question_mark,q", "dismiss", "close")]
 

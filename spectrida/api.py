@@ -672,6 +672,7 @@ class IDADatabase:
         *,
         min_fields: int = 2,
         rename: bool = True,
+        reenter_any: bool = False,
     ) -> dict:
         """Recover a C struct for parameter *arg_index* of the function at
         *address* from the offsets it's dereferenced at, then apply it.
@@ -696,9 +697,37 @@ class IDADatabase:
         a = address if isinstance(address, int) else int(address, 16)
         self._ensure_structs_loaded()
         ev = await self._b.struct_evidence(a, arg_index)
+
+        # Is this param already typed as a struct we should re-derive? Either one of
+        # OUR recovered structs, or (rebuild mode) any struct pointer.
+        var_idents = extract_type_identifiers(ev.get("var_type", ""))
+        known = [i for i in var_idents if i in self._struct_layouts]
+        forced_name = known[0] if known else (
+            var_idents[0] if (reenter_any and var_idents) else "")
+
+        # When re-entering a typed param, its accesses decompile as `a0->field`,
+        # and harvesting those can under-collect. Strip the type back to a raw
+        # pointer, re-decompile to recover the `*(T*)(a0+off)` form (reliable), and
+        # re-apply the merged struct below. (The strip is internal — not audited.)
+        stripped = False
+        if forced_name and rename:
+            await self._b.apply_struct(a, arg_index, "void *")
+            stripped = True
+            ev = await self._b.struct_evidence(a, arg_index)
+
         layout = reconcile_fields(ev.get("evidence", []))
         real = real_fields(layout)
         if len(real) < min_fields:
+            if forced_name:
+                # nothing new harvestable; restore the type if we stripped it and
+                # report a no-op against the accumulated struct (never too_few here)
+                if stripped:
+                    await self._b.apply_struct(a, arg_index, forced_name + " *")
+                total = len(real_fields(self._struct_layouts.get(forced_name, [])))
+                return {"ok": True, "struct": forced_name, "fields": total,
+                        "added": 0, "applied": True, "reused": False,
+                        "grew": False, "new_struct": False, "dropped": [],
+                        "reason": ""}
             return {"ok": False, "reason": "too_few_fields", "struct": "",
                     "fields": len(real), "added": 0, "applied": False,
                     "reused": False, "grew": False, "new_struct": False,
@@ -708,16 +737,13 @@ class IDADatabase:
         sig = struct_signature(layout)
         dropped: list[dict] = []
 
-        # 1. choose the target struct name.
-        #    a) the param is already typed as a struct WE recovered → merge into it
-        #       (this is what lets a 2nd F pass refine already-typed params);
+        # choose the target struct name.
+        #    a) re-entering a typed param → merge into THAT struct (forced);
         #    b) a rich shape matches a known signature → reuse that struct;
         #    c) otherwise the model names a (possibly new) struct.
-        cur_idents = [i for i in extract_type_identifiers(ev.get("var_type", ""))
-                      if i in self._struct_layouts]
         reused = False
-        if cur_idents:
-            name = cur_idents[0]
+        if forced_name:
+            name = forced_name
         elif len(real) >= _STRUCT_REUSE_MIN_FIELDS and sig in self._structs_by_sig:
             name = self._structs_by_sig[sig]
             reused = True
@@ -776,6 +802,7 @@ class IDADatabase:
         min_fields: int = 2,
         limit: int = 100_000,
         rename: bool = True,
+        rebuild: bool = False,
         progress_cb=None,
     ) -> dict:
         """Recover structs across the binary — for every generic pointer parameter
@@ -807,12 +834,17 @@ class IDADatabase:
 
         def _recoverable(ty: str) -> bool:
             # a generic pointer, OR a param already typed as one of OUR recovered
-            # structs (so a repeat pass keeps merging in newly-seen fields) — but
-            # never a real, pre-existing named type from the type library.
+            # structs (so a repeat pass keeps merging in newly-seen fields). In
+            # rebuild mode, ANY struct pointer is re-derived from code — use to
+            # repair structs that got clobbered before the accumulating store
+            # existed (re-derives every struct param, so types not from our
+            # recovery get rebuilt too).
             if _struct_candidate_type(ty):
                 return True
-            return any(i in self._struct_layouts
-                       for i in extract_type_identifiers(ty))
+            idents = extract_type_identifiers(ty)
+            if any(i in self._struct_layouts for i in idents):
+                return True
+            return bool(rebuild and "*" in ty and idents)
 
         totals = {"functions": 0, "structs": 0, "fields": 0, "applied": 0,
                   "reused": 0, "merged": 0, "dropped": 0}
@@ -827,7 +859,8 @@ class IDADatabase:
                 if not _recoverable(lv.get("type", "")):
                     continue
                 r = await self.recover_struct(f["start"], idx,
-                                              min_fields=min_fields, rename=rename)
+                                              min_fields=min_fields, rename=rename,
+                                              reenter_any=rebuild)
                 items.append({"arg": idx, "var": lv.get("name", ""), "result": r})
                 if r.get("ok"):
                     recovered_here = True

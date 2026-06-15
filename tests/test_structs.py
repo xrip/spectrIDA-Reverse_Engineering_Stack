@@ -276,6 +276,26 @@ def test_recover_struct_reenters_typed_param():
     asyncio.run(run())
 
 
+def test_recover_struct_rebuild_reenters_orphan():
+    async def run():
+        async with open_demo() as db:
+            # a struct applied by an earlier run, NOT in our accumulated store
+            demo._demo_applied_struct_types[(0x1400013A0, 0)] = "OrphanStruct *"
+            demo._DEMO_KNOWN_TYPES.add("OrphanStruct")
+            try:
+                # reenter_any strips the type, re-harvests raw accesses, and
+                # re-derives the struct under its existing name
+                r = await db.recover_struct(0x1400013A0, 0, reenter_any=True)
+                assert r["ok"]
+                assert r["struct"] == "OrphanStruct"
+                assert r["fields"] == 2
+                assert "OrphanStruct" in db._struct_layouts   # now tracked
+            finally:
+                demo._demo_applied_struct_types.clear()
+                demo._DEMO_KNOWN_TYPES.discard("OrphanStruct")
+    asyncio.run(run())
+
+
 def test_recover_struct_too_few_fields():
     async def run():
         async with open_demo() as db:
