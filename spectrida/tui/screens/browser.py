@@ -149,6 +149,7 @@ class BrowserScreen(Screen):
         Binding("b", "batch_name", "Batch-all"),
         Binding("u", "unnamed_branches", "Unnamed"),
         Binding("t", "deep_branch", "Deep"),
+        Binding("f", "recover_structs", "Structs"),
         Binding("o", "overview", "Overview"),
         Binding("bracketright", "scroll_report_down", "Report▼", show=False),
         Binding("bracketleft", "scroll_report_up", "Report▲", show=False),
@@ -636,6 +637,63 @@ class BrowserScreen(Screen):
             bar.clear_progress()
             bar.set_info(f"{self._b.title} · deep branch — {state['named']} named, "
                          f"{state['vars']} vars, {state['typed']} typed")
+        except Exception as e:
+            spin.update("")
+            res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")
+        finally:
+            self._busy = False
+            try:
+                self.query_one(StatusBar).clear_progress()
+            except Exception:
+                pass
+
+    # ── struct recovery (recover structs from field-access patterns) ──
+    def action_recover_structs(self) -> None:
+        if self._busy:
+            self.notify("still working — wait a moment", severity="warning")
+            return
+        self._spawn(self._recover_structs())
+
+    async def _recover_structs(self) -> None:
+        """Recover C structs for generic pointer parameters across the binary and
+        apply them. Best run after the whole-binary naming sweep ('B')."""
+        self._busy = True
+        res  = self.query_one("#model-result", Static)
+        rsn  = self.query_one("#model-reason", Static)
+        bar  = self.query_one(StatusBar)
+        spin = self.query_one("#model-spinner", Static)
+        self.query_one("#model-hint", Static).update("")
+        rsn.update("")
+        spin.update("  ▸ recovering structs from field accesses…")
+        recovered: list[str] = []
+        try:
+            from spectrida.api import IDADatabase
+            db = IDADatabase(self._b)
+
+            async def progress_cb(done: int, addr: int, r: dict) -> None:
+                if r.get("ok"):
+                    tag = "reused" if r.get("reused") else (
+                        "applied" if r.get("applied") else "made")
+                    recovered.append(f"  [b cyan]{r['struct']}[/] "
+                                     f"[dim]({r['fields']} fields, {tag})[/]")
+                    spin.update(f"  ▸ recovered {len(recovered)} struct(s)…")
+                    rsn.update("\n".join(recovered[-40:]))
+
+            totals = await db.recover_structs(scope="named", progress_cb=progress_cb)
+            spin.update("")
+            drop = f", {totals['dropped']} dropped" if totals.get("dropped") else ""
+            reuse = f", {totals['reused']} reused" if totals.get("reused") else ""
+            if not totals["structs"]:
+                res.update("  [dim]no recoverable structs — run naming ('B') first, "
+                           "or no generic pointer params with field accesses.[/]")
+            else:
+                res.update(f"  [b cyan]{totals['structs']}[/] structs · "
+                           f"[b green]{totals['applied']}[/] applied · "
+                           f"[magenta]{totals['fields']}[/] fields{reuse}{drop}")
+                if not recovered:
+                    rsn.update(f"  recovered across {totals['functions']} functions")
+            bar.set_info(f"{self._b.title} · structs — {totals['structs']} recovered, "
+                         f"{totals['applied']} applied{drop}")
         except Exception as e:
             spin.update("")
             res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")

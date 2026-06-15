@@ -24,10 +24,17 @@ from typing import TypedDict
 
 from spectrida.config import (
     name_cache_enabled,
+    struct_recovery_enabled,
     type_propagation_enabled,
     type_retry_enabled,
 )
 from spectrida.core import namecache
+from spectrida.core.structs import (
+    merge_field_names,
+    reconcile_fields,
+    struct_decl,
+    struct_signature,
+)
 from spectrida.core.types import extract_type_identifiers
 from spectrida.core.backend import DemoBackend, RealBackend
 from spectrida.core.glossary import Glossary
@@ -111,6 +118,22 @@ _GENERIC_NAMES = frozenset({
 })
 
 
+def _struct_candidate_type(ty: str) -> bool:
+    """A parameter type worth trying to recover a struct for: a *generic* pointer
+    (or pointer-width scalar) that doesn't already name a known struct/enum. We
+    never re-recover a parameter that already has a real typed struct."""
+    t = (ty or "").strip()
+    if not t:
+        return False
+    if extract_type_identifiers(t):   # already references a named type → leave it
+        return False
+    if "*" in t:                       # void *, char *, _QWORD *, …
+        return True
+    return t.replace(" ", "") in {
+        "__int64", "unsigned__int64", "_QWORD", "__int32", "int", "void",
+    }
+
+
 def _worth_propagating(ret_type: str) -> bool:
     """A return type worth pushing onto callers: a pointer or a named struct/enum
     (not a plain scalar like int/void)."""
@@ -164,6 +187,7 @@ class IDADatabase:
         self._glossary_seeded = False
         self._cache = NameCache(enabled=name_cache_enabled())
         self._cache_loaded = False
+        self._structs_by_sig: dict[str, str] = {}   # F: layout signature → struct name
 
     async def _ensure_cache_loaded(self) -> None:
         """Load the on-disk naming cache (next to the .i64) once."""
@@ -539,6 +563,133 @@ class IDADatabase:
             "dropped": dropped, "propagated": propagated,
             "pseudocode": pseudocode,
         }
+
+    # ── struct recovery (F) ───────────────────────────────────────────────────
+
+    async def recover_struct(
+        self,
+        address: int | str,
+        arg_index: int = 0,
+        *,
+        min_fields: int = 2,
+        rename: bool = True,
+    ) -> dict:
+        """Recover a C struct for parameter *arg_index* of the function at
+        *address* from the offsets it's dereferenced at, then apply it.
+
+        Pipeline: harvest field-access evidence → reconcile a deterministic,
+        non-overlapping layout → (model) name the struct + fields, refine scalar
+        types → register the struct in IDA → set the parameter to ``Struct *``.
+        Offsets/sizes come only from observed accesses, never the model.
+
+        Structurally identical pointers (same offset/size shape) reuse a single
+        recovered struct (`struct_signature` dedup), so clones collapse.
+
+        Returns ``{ok, struct, fields, applied, reused, dropped, reason}``.
+        """
+        a = address if isinstance(address, int) else int(address, 16)
+        ev = await self._b.struct_evidence(a, arg_index)
+        layout = reconcile_fields(ev.get("evidence", []))
+        real = [f for f in layout if "padding" not in (f.get("flags") or [])]
+        if len(real) < min_fields:
+            return {"ok": False, "reason": "too_few_fields", "struct": "",
+                    "fields": len(real), "applied": False, "reused": False,
+                    "dropped": []}
+
+        await self._ensure_glossary_seed()
+        sig = struct_signature(layout)
+        reused = sig in self._structs_by_sig
+        dropped: list[dict] = []
+
+        if reused:
+            name = self._structs_by_sig[sig]
+        else:
+            named = await self._b.name_struct(
+                layout, ev.get("snippet", ""), glossary=self._glossary.render())
+            layout = merge_field_names(layout, named.get("fields", {}))
+            name = named.get("struct_name") or ""
+            if not name:
+                func = next((f for f in await self.list_functions()
+                             if f["start"] == a), None)
+                base = (func["name"] if func else hex(a)).replace("$$", "_")
+                name = "%s_arg%d_t" % (base, arg_index)
+            if rename:
+                decl = struct_decl(name, layout)
+                mk = await self._b.make_struct(name, decl)
+                if not mk.get("ok"):
+                    return {"ok": False, "reason": "make_failed", "struct": name,
+                            "fields": len(real), "applied": False, "reused": False,
+                            "dropped": mk.get("dropped", [])}
+            self._structs_by_sig[sig] = name
+            self._glossary.add_term(name)
+
+        applied = False
+        if rename:
+            ap = await self._b.apply_struct(a, arg_index, name + " *")
+            applied = bool(ap.get("applied"))
+            dropped = ap.get("dropped", []) or []
+
+        return {"ok": True, "struct": name, "fields": len(real),
+                "applied": applied, "reused": reused, "dropped": dropped,
+                "reason": ""}
+
+    async def recover_structs(
+        self,
+        *,
+        scope: str = "named",
+        min_fields: int = 2,
+        limit: int = 100_000,
+        rename: bool = True,
+        progress_cb=None,
+    ) -> dict:
+        """Recover structs across the binary — for every generic pointer parameter
+        with enough distinct field accesses.
+
+        Best run AFTER the whole-binary naming sweep (``B``): named functions give
+        the model meaningful naming context, and a recovered ``Struct *`` becomes a
+        natural seed for return-type propagation (D).
+
+        Args:
+            scope: ``"named"`` (default) processes only functions that already have
+                   a real name; ``"all"`` includes ``sub_*`` too.
+            min_fields: minimum distinct fields before a struct is worth creating.
+            limit:      cap on functions scanned.
+
+        Returns ``{"functions", "structs", "fields", "applied", "reused",
+        "dropped"}``.
+        """
+        funcs = await self.list_functions()
+        if scope == "named":
+            targets = [f for f in funcs if not f["name"].lower().startswith("sub_")]
+        else:
+            targets = list(funcs)
+        targets = targets[:limit]
+
+        totals = {"functions": 0, "structs": 0, "fields": 0, "applied": 0,
+                  "reused": 0, "dropped": 0}
+        done = 0
+        for f in targets:
+            info = await self._b.get_lvars(f["start"])
+            args = [lv for lv in info.get("lvars", []) if lv.get("is_arg")]
+            recovered_here = False
+            for idx, lv in enumerate(args):
+                if not _struct_candidate_type(lv.get("type", "")):
+                    continue
+                r = await self.recover_struct(f["start"], idx,
+                                              min_fields=min_fields, rename=rename)
+                if r.get("ok"):
+                    recovered_here = True
+                    totals["structs"] += 1
+                    totals["fields"] += r.get("fields", 0)
+                    totals["applied"] += 1 if r.get("applied") else 0
+                    totals["reused"] += 1 if r.get("reused") else 0
+                totals["dropped"] += len(r.get("dropped") or [])
+                if progress_cb:
+                    done += 1
+                    await progress_cb(done, f["start"], r)
+            if recovered_here:
+                totals["functions"] += 1
+        return totals
 
     async def name_branch(
         self,

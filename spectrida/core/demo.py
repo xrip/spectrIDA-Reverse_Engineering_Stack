@@ -246,6 +246,65 @@ def propagate_ret(addr) -> dict:
     return {"propagated": len(callers), "callers": len(callers)}
 
 
+# ── struct recovery (demo, F) ────────────────────────────────────────────────
+
+# field-access evidence keyed by (func_addr, arg_index): offset/size/kind tuples
+# observed on a pointer parameter, as the worker would harvest from the ctree.
+_DEMO_STRUCT_EVIDENCE = {
+    # arg 0 (Entity *) — used by the explicit recover_struct() demo test
+    (0x1400013A0, 0): [
+        {"offset": 0x0,  "size": 8, "kind": "deref"},   # vtable / sub-pointer
+        {"offset": 0x40, "size": 4, "kind": "write"},   # health field
+        {"offset": 0x40, "size": 4, "kind": "read"},
+    ],
+    # arg 1 (a generic pointer) — so the whole-binary recover_structs() sweep,
+    # which only targets generic (un-named) pointer params, finds a candidate
+    (0x1400013A0, 1): [
+        {"offset": 0x0,  "size": 8, "kind": "deref"},
+        {"offset": 0x40, "size": 4, "kind": "write"},
+        {"offset": 0x40, "size": 4, "kind": "read"},
+    ],
+}
+# what the (fake) model names the recovered fields, keyed by offset
+_DEMO_STRUCT_FIELDS = {0x0: ("vtable", "void *"), 0x40: ("health", "float")}
+
+
+def struct_evidence(addr, arg_index: int = 0) -> dict:
+    a = _norm(addr)
+    ev = _DEMO_STRUCT_EVIDENCE.get((a, arg_index), [])
+    return {"evidence": [dict(e) for e in ev],
+            "snippet": _demo_state(a)["pseudocode"] if ev else "",
+            "var_name": "a%d" % (arg_index + 1), "var_type": "void *"}
+
+
+def name_struct(layout: list[dict], snippets: str, glossary: str = "") -> dict:
+    fields: dict[str, dict] = {}
+    for f in layout:
+        if "padding" in (f.get("flags") or []):
+            continue
+        off = int(f["offset"])
+        nm, ty = _DEMO_STRUCT_FIELDS.get(off, ("field_%X" % off, f.get("type", "")))
+        fields["0x%X" % off] = {"name": nm, "type": ty}
+    return {"struct_name": "EntityState", "fields": fields,
+            "reason": "demo struct recovered from observed field accesses"}
+
+
+def make_struct(name: str, decl: str) -> dict:
+    # register the new type in the demo's pretend type library
+    _DEMO_KNOWN_TYPES.add(name)
+    return {"ok": True, "name": name, "errors": 0, "dropped": []}
+
+
+def apply_struct(addr, arg_index: int, type_str: str) -> dict:
+    from spectrida.core.types import extract_type_identifiers
+    for ident in extract_type_identifiers(type_str):
+        if ident not in _DEMO_KNOWN_TYPES:
+            return {"applied": False,
+                    "dropped": [{"var": "a%d" % (arg_index + 1), "type": type_str,
+                                 "reason": "unknown_type:%s" % ident}]}
+    return {"applied": True, "dropped": []}
+
+
 def rename_lvars(addr, names: dict, ret_type: str = "") -> dict:
     st = _demo_state(_norm(addr))
     code = st["pseudocode"]

@@ -519,6 +519,65 @@ async def correct_types(pseudocode: str, failed: list[dict]) -> dict[str, str]:
     return out
 
 
+async def name_struct(layout: list[dict], snippets: str, *,
+                      glossary: str = "") -> dict:
+    """Name a recovered struct and its fields (F — struct recovery).
+
+    *layout* = the reconciled field list ``[{offset, size, type, flags}, …]`` whose
+    offsets/sizes are FIXED (observed, not negotiable). *snippets* are a few
+    pseudocode lines showing how the base pointer is used, for naming context.
+
+    Returns ``{"struct_name": str, "fields": {hex_offset: {"name","type"}},
+    "reason": str}``. The model may refine a field's scalar type (e.g. ``_DWORD``
+    → ``BOOL``, ``void *`` → ``Player *``) but MUST keep offsets/sizes; the host
+    re-checks every type in IDA and drops mismatches.
+    """
+    if not layout:
+        return {"struct_name": "", "fields": {}, "reason": ""}
+    rows = []
+    for f in layout:
+        if "padding" in (f.get("flags") or []):
+            continue
+        rows.append('  - offset 0x%X, %d bytes, current type %s'
+                    % (int(f["offset"]), int(f["size"]), f.get("type", "?")))
+    fields_block = "\n".join(rows)
+    user_msg = (
+        (f"{glossary}\n\n" if glossary else "")
+        + "You are recovering a C struct from the field accesses observed on a "
+        "pointer parameter across the binary. The OFFSETS and SIZES below are fixed "
+        "(observed from real accesses) — do NOT change them. Give the struct a "
+        "descriptive PascalCase name and name each field in snake_case. You may "
+        "refine a field's type when the usage makes it clear (a pointer, an existing "
+        "struct/enum from this binary, BOOL, float, etc.), but the type's width must "
+        "match the field size.\n\n"
+        f"Observed fields:\n{fields_block}\n\n"
+        f"How the pointer is used:\n{(snippets or '')[:4000]}\n\n"
+        'Reply ONLY with JSON: {"struct_name": "PlayerState", '
+        '"fields": {"0x40": {"name": "health", "type": "float"}, …}, '
+        '"reason": "one sentence"}'
+    )
+    raw = await _stream_chat([
+        {"role": "system", "content": _build_system()},
+        {"role": "user",   "content": user_msg},
+    ], json_mode=llm_json_mode())
+    obj = extract_json_object(raw)
+    name = obj.get("struct_name") or obj.get("name") or ""
+    if not (isinstance(name, str) and name.isidentifier()):
+        name = ""
+    fields_raw = obj.get("fields") or {}
+    fields: dict[str, dict] = {}
+    if isinstance(fields_raw, dict):
+        for k, v in fields_raw.items():
+            if isinstance(v, dict):
+                fields[str(k)] = {"name": str(v.get("name", "") or ""),
+                                  "type": str(v.get("type", "") or "")}
+            elif isinstance(v, str):
+                fields[str(k)] = {"name": v, "type": ""}
+    reason = obj.get("reason") or obj.get("reasoning") or ""
+    return {"struct_name": name, "fields": fields,
+            "reason": reason if isinstance(reason, str) else ""}
+
+
 async def name_variables(pseudocode: str, lvars: list[dict]) -> dict[str, str]:
     """Ask the model for a {old_name: {name, type}} mapping for locals + params."""
     if not lvars:

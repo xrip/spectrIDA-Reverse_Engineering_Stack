@@ -205,6 +205,14 @@ def type_propagation_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def struct_recovery_enabled() -> bool:
+    """Recover C structs from field-access patterns and apply them to pointer
+    parameters (default ON). Disable with SPECTRIDA_STRUCT_RECOVERY=0.
+    """
+    raw = get("pipeline", "struct_recovery", "SPECTRIDA_STRUCT_RECOVERY").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def name_cache_enabled() -> bool:
     """Cache naming results by normalized function content (default on).
 

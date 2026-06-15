@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Struct recovery from field accesses (`F`).** Recovers a C struct for a
+  function's generic pointer parameter from the offsets/sizes it's dereferenced
+  at, names the struct + fields (LLM), registers it in IDA, and sets the
+  parameter to `Struct *` — so Hex-Rays re-renders `a1->health` instead of
+  `*(_DWORD *)(a1 + 0x40)`. The layout is computed **deterministically** from
+  observed accesses (`spectrida/core/structs.py`, pure + tested) — the model only
+  names fields and refines scalar types, it can't move offsets. Widest-access-wins,
+  padding gaps filled, overlaps flagged `union_candidate`, pointer fields detected.
+  Structurally identical pointers collapse to one struct (`struct_signature`).
+  Names are applied **before** typing (IDA splits the two ops). Driver
+  `recover_struct` / `recover_structs` (run after the `B` sweep for best context;
+  a recovered `Struct *` then seeds return-type propagation). Kill switch
+  `SPECTRIDA_STRUCT_RECOVERY=0`.
 - **Confidence + refine pass (whole-binary).** Each naming result now carries a
   confidence (`high`/`medium`/`low`); low-confidence guesses are kept out of the
   project glossary (no vocabulary pollution). The `B` whole-binary sweep runs a

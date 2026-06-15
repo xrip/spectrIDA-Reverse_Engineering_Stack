@@ -43,6 +43,7 @@ class HelpScreen(ModalScreen[None]):
         ("B", "deep-name the WHOLE binary, branch by branch (bottom-up; types named funcs too)"),
         ("U", "find every sub_* branch and deep-name it (bottom-up)"),
         ("T", "deep-name this call branch (bottom-up; re-types already-named funcs)"),
+        ("F", "recover structs from field accesses, apply to pointer params"),
         ("O", "overview — AI summary of the whole binary"),
         ("[ / ]", "scroll the report pane (mouse wheel works too)"),
         ("/", "fuzzy search"),

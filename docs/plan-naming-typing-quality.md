@@ -1,9 +1,18 @@
 # Implementation Plan — Naming Uniformity & Typing Correctness (E + A + B)
 
-> **Status:** E ✅ · A ✅ · B ✅ · E-2 ✅ · H+I ✅ · D ✅ — done (49 tests green).
+> **Status:** E ✅ · A ✅ · B ✅ · E-2 ✅ · H+I ✅ · D ✅ · F ✅ — done (69 tests green).
 > Also added: scrollable TUI report pane (`[`/`]` + wheel).
-> Remaining (broader proposal, not yet built): F (struct recovery),
+> Remaining (broader proposal, not yet built):
+> **G (global variable naming + typing — speced below)**,
 > C (naming-canonicalization linter), disasm-path caching.
+> F notes: layout engine is pure (`core/structs.py`); worker harvests evidence
+> (`struct_evidence`) + registers via `parse_decls` of a host-built C decl
+> (`make_struct`) + applies through the prototype (`apply_struct`, rename→type
+> ordering preserved — struct fields are named at creation, then the type is set
+> on the param). Driver `recover_struct`/`recover_structs`, TUI key `F`,
+> `SPECTRIDA_STRUCT_RECOVERY` (default on). Cross-function evidence aggregation
+> deferred — v1 harvests within the single function (signature dedup already
+> collapses clones).
 > Deviation in A: domain vocabulary is auto-derived from name stems (zero-cost,
 > deterministic) instead of parsing `overview()` prose; `seed_overview` not added.
 > Note: B's worker growth from E required moving the idalib worker off `python -c`
@@ -226,6 +235,219 @@ class NameCache:
 - Integration via demo: instrument `DemoBackend.name_function_staged` with a call
   counter; call `name_all` twice on the same demo function; assert the second is a
   cache hit (counter unchanged) and returns the same name.
+
+---
+
+## F — Struct recovery from field-access patterns
+
+### Goal
+Turn `*(int *)(a1 + 0x18)` / `a1[10]` access soup into real structs: synthesize a
+`struct` type for a pointer/`this` parameter (or a global) from the set of offsets
+it's dereferenced at across all functions, apply it, and let Hex-Rays re-render
+`a1->health` instead of `*(_DWORD *)(a1 + 0x18)`. This is the **largest single
+readability jump** — it converts dozens of opaque offset arithmetic sites into
+named field accesses at once and unlocks return/arg typing (D) to carry the new
+struct around.
+
+### Why this shape
+A struct's shape is the **union of how a pointer is dereferenced across every
+function that receives it** — no single site is authoritative. So recovery is a
+*collect-then-synthesize* pass: gather `(offset, access-size, access-kind)` tuples
+for one base pointer from all call sites, reconcile them into a field layout, name
+the fields with the LLM (context = the accessing snippets), create the UDT, apply.
+The model names; the **layout is computed deterministically** from observed
+offsets (never hallucinated), which keeps it safe.
+
+### Integration points
+
+**1. Worker: harvest field accesses (`ida.py` `_WORKER`)**
+- New cmd `struct_evidence(func_ea, arg_index|var)`: decompile the function, walk
+  the ctree (`ctree_visitor_t`, CV_FAST) collecting every dereference of the target
+  base expression — patterns `*(T *)(base + off)`, `base[idx]`, `cot_memref` once a
+  partial struct exists. For each emit `{offset, size, kind}` where `size` from the
+  cast/`cot_ptr` width, `kind` ∈ read / write / call-arg / address-taken / deref
+  (nested pointer → candidate sub-struct pointer). Offsets resolved through
+  `cot_add` constant folding.
+- Aggregate across functions at the host layer (step 3), not in the worker — the
+  worker only reports raw evidence per function.
+- New cmd `make_struct(name, fields)`: build a UDT via `ida_typeinf` /
+  `til` (`tinfo_t.create_udt`, `add_member` at fixed offsets; gaps → padding
+  `_BYTE field_NN[gap]`; nested pointers → forward-declared struct ptr). Validate +
+  read-back (reuse E). Returns the created type name or a `dropped` reason.
+- New cmd `apply_struct(target, type)`: set the param/var/global's type to the new
+  `Struct *` (reuses `_set_func_proto` / `_set_lvar_type` / `set_global` from G).
+
+**2. Pure helper `spectrida/core/structs.py`** (IDA-free, unit-testable)
+- `reconcile_fields(evidence) -> list[Field]` — the deterministic layout engine.
+  Input: aggregated `{offset, size, kind}` tuples. Output: ordered, non-overlapping
+  field list with sizes, padding gaps, and per-field flags (is_pointer,
+  array-candidate when stride pattern detected). Conflict policy: widest observed
+  access at an offset wins; overlapping accesses (offset 0x10 read as 4 and 8) →
+  prefer the larger and flag `union_candidate`; never emit overlapping members.
+- `struct_signature(fields) -> str` — content hash of the layout (offset+size set)
+  so two pointers with the **same shape** collapse to one struct (clone instances,
+  shared base classes) — composes with B's caching philosophy.
+- `propose_field_names(fields, snippets) -> ...` — packaging only; actual naming is
+  the LLM call. Pure part just bounds/orders the evidence fed to the model.
+
+**3. Backend: `name_struct` LLM call (`llamacpp.py` / `backend.py` / `demo.py`)**
+- `RealBackend.name_struct(layout, snippets)`: prompt = the computed field layout
+  (offsets + sizes + access kinds) + a few representative accessing snippets per
+  field + glossary (A) → ask for `{struct_name, fields:{off: {name, type}},
+  reason}`. The model may **refine** a field's scalar type (e.g. `int` → `BOOL`,
+  ptr → `Player *`) but **cannot change offsets/sizes** (host enforces; mismatches
+  dropped). Deterministic sampling, `_RE_SYSTEM` prefix reused.
+- `Backend` ABC + `DemoBackend` stub.
+
+**4. `IDADatabase` driver (`api.py`)**
+- `recover_struct(target)` where `target` = `(func_ea, arg_index)` or a global ea:
+  1. find all functions that receive this pointer (xref/dataflow: for a `this`/arg,
+     follow the call graph one hop — callers passing into this arg, and callees it's
+     forwarded to; bounded depth);
+  2. `struct_evidence` on each → aggregate;
+  3. `reconcile_fields` → layout; `struct_signature` → dedup against already-built
+     structs (reuse, don't duplicate);
+  4. `name_struct` → names/refines;
+  5. `make_struct` + `apply_struct` on every site that uses this shape;
+  6. feed struct name into glossary (A); the new `Struct *` becomes a D-propagation
+     seed automatically.
+- `recover_structs(*, scope="all", min_fields=2, min_sites=1, progress_cb,
+  plan_cb)`: candidate targets = pointer-typed params/returns/globals that have ≥N
+  offset accesses and no existing UDT. Totals `{structs, fields, applied_sites,
+  dropped}`. Runs **after B** (functions named → snippets meaningful) and naturally
+  **before/with G** (a recovered global struct improves global typing).
+
+**5. TUI (`browser.py`)**
+- New key (e.g. `F` "recover struct") → `_recover_struct` on the focused function's
+  primary pointer arg, plus a sweep variant. Shared progress UI; summary
+  `struct <Name> · fields N · sites M · dropped D`. Update `HelpScreen._KEYS`.
+
+### Tests (F)
+- `tests/test_structs.py` (new, pure): `reconcile_fields` — non-overlapping layout
+  from scattered offsets, padding-gap insertion, widest-access-wins, overlap →
+  `union_candidate`, array stride detection; `struct_signature` equal for
+  same-shape / different for different-shape.
+- Integration via demo: `demo.py` stubs for `struct_evidence` (returns canned
+  offset tuples), `make_struct`/`apply_struct`/`name_struct`; assert
+  `recover_struct` builds the expected field set, names it, and a forced
+  offset-mismatch from the model lands in `dropped`.
+- Real IDA: a function with obvious `a1+off` accesses → run `F`, confirm Hex-Rays
+  re-renders `a1->field` and `retyped`/applied-sites count is correct; confirm an
+  existing hand-made struct is **not** clobbered.
+
+### Risks
+- *Hallucinated layout*: eliminated — offsets/sizes are observed, model only names.
+  Read-back gate on `make_struct`.
+- *Over-merging distinct types* sharing a prefix shape: `struct_signature` keys on
+  the full offset+size set, not a prefix; require `min_fields`/`min_sites` floors.
+- *Union ambiguity*: don't auto-create unions; flag `union_candidate` and pick the
+  dominant access, leaving a comment — full union recovery is a later refinement.
+- *Cross-function aggregation cost*: bound the caller/callee follow depth; process
+  highest-xref pointers first so early stop keeps the best wins.
+
+---
+
+## G — Global variable naming + typing (sequenced after F)
+
+### Goal
+Name and type the binary's generic globals (`dword_*`, `byte_*`, `off_*`,
+`unk_*`, `qword_*`, `xmmword_*`, `g_*` placeholders) using the **already-named,
+high-quality functions** that reference them as context. Globals are the missing
+half of typing: locals/args/returns are handled (E/D), but a `dword_140C00010`
+touched by 40 functions stays anonymous and untyped, and its type can't propagate.
+
+### Why this shape
+A global's meaning is distributed across its use sites, not contained in one
+function. The richest evidence comes from the **best-understood** call sites
+(named, typed, API/string-bearing), not from every site — feeding 40 raw
+pseudocode bodies is noisy and expensive. So: rank globals by leverage (xref
+count), rank each global's referencing functions by analysis quality, and let the
+model reason over the top-K sites only.
+
+### Integration points
+
+**1. Worker: enumerate + describe globals (`ida.py` `_WORKER`)**
+- New cmd `list_globals`: walk data segments / `idautils.Names()`, keep entries
+  whose name matches the generic pattern (`_GENERIC_DATA_RE` = `dword_|byte_|word_
+  |qword_|off_|unk_|stru_|asc_|xmmword_|flt_|dbl_` etc.) AND that have ≥1 code
+  xref. For each emit `{ea, name, size, cur_type, nxrefs}` where `nxrefs =
+  len(list(idautils.XrefsTo(ea)))` restricted to code refs.
+- New cmd `global_context(ea, top_k)`: for the global at `ea`, gather code xrefs,
+  resolve each to its containing function, score each function (see step 3), keep
+  the top-`top_k`, and for each return `{func_ea, func_name, proto, snippet}`
+  where `snippet` is the few pseudocode lines around the access (a windowed slice
+  of `decompile()` text, not the whole body) plus the access kind (read / write /
+  call-arg / address-taken) derived from the ctree (`cot_obj` parent: `cot_asg`
+  lhs = write, rhs = read, `cot_call` arg = arg).
+- New cmd `set_global(ea, name, type)`: `idc.set_name(ea, name, SN_NOWARN)` +
+  `idc.SetType(ea, type)` / `ida_typeinf.apply_tinfo`, reusing the **same
+  `_classify_type` validation + read-back** from E (no silent drops; return a
+  `dropped` reason on failure). Name dedup mirrors the lvar path.
+
+**2. Pure helper `spectrida/core/globals.py`** (IDA-free, unit-testable)
+- `is_generic_global(name) -> bool` — the `_GENERIC_DATA_RE` allowlist (mirrors the
+  worker inline copy, like `types.py`).
+- `function_quality(meta) -> float` — the "entropy"/quality score for ranking
+  referencing functions. Inputs from cheap per-function metadata already available
+  (named?, proto typed?, #distinct api_calls, #strings, #named callees, body len).
+  Score favours: non-generic name (`not sub_*`), a real typed proto, more distinct
+  API calls / strings (information content), more named neighbours; penalises huge
+  bodies (diffuse signal). This is the "several named functions with higher
+  entropy" selection — entropy ≈ distinct-signal density, not raw size.
+- `rank_globals(globals) -> list` — sort by `nxrefs` desc (leverage), tie-break by
+  size then ea.
+
+**3. Backend: `name_global` LLM call (`llamacpp.py` / `backend.py` / `demo.py`)**
+- `RealBackend.name_global(ea)`: `list`/`global_context` → build a prompt:
+  global's current name/size/type + the top-K `{func_name, proto, access-kind,
+  snippet}` blocks + the **project glossary** (A, uniformity) → ask for
+  `{name, type, reason}` (one JSON call, deterministic sampling like staged).
+- Reuses `_RE_SYSTEM` prefix (KV-cache); global-specific instructions + context go
+  in the **user turn**. `DemoBackend.name_global` returns a deterministic stub.
+- `Backend` ABC gains `name_global(ea) -> dict`.
+
+**4. `IDADatabase` driver (`api.py`)**
+- `name_globals(*, scope="all", top_k=5, min_xrefs=2, rename=True, progress_cb,
+  plan_cb)`:
+  - `globals = await self._b.list_globals()`; `rank_globals`; filter `nxrefs >=
+    min_xrefs`.
+  - For each: `staged = await self._b.name_global(ea)`; validate; `set_global`;
+    feed the applied name into the **glossary** (A) and, when the chosen type is a
+    pointer/struct/enum, it's a natural seed for **D**-style propagation into the
+    functions that load it (future).
+  - Totals `{globals, named, typed, dropped}`.
+  - Runs **after** the function sweep (`B`) so referencing functions are already
+    named/typed → maximum context quality. Document this ordering.
+- Optional name-cache (B) keyed on `(normalized snippets + access kinds + glossary
+  vocab)` so identical global-usage shapes collapse — defer unless cheap.
+
+**5. TUI (`browser.py`)**
+- New key (e.g. `G` "name globals") → `_name_globals` running `name_globals` with
+  the shared deep-tree/sweep progress UI (`_make_deep_callbacks`-style), summary
+  line `globals N · named M · typed K · dropped D`. Update `HelpScreen._KEYS`.
+
+### Tests (G)
+- `tests/test_globals.py` (new, pure): `is_generic_global` table (`dword_140…`
+  yes, `g_PlayerList` borderline, `WinMain` no); `function_quality` ordering (a
+  named+typed+api-rich fn outranks a `sub_*` stub); `rank_globals` sorts by xref
+  count.
+- Integration via demo: add a couple of generic globals + xrefs to `demo.py`
+  (`list_globals`/`global_context`/`set_global`/`name_global` stubs); assert
+  `name_globals` names them, applies a type, records them in the glossary, and a
+  bogus type lands in `dropped`.
+- Real IDA: pick a hot global (`dword_*` with many xrefs), run `G`, confirm the
+  name/type stick (read-back) and that low-xref noise is skipped by `min_xrefs`.
+
+### Risks
+- *Wrong type from one-sided evidence*: a global written as `int` but used as a
+  flags field. Mitigate by requiring agreement across ≥2 top sites for a non-scalar
+  type, else fall back to the size-derived scalar; never clobber an existing
+  non-generic type (read-back gate, like D).
+- *Cost*: bounded by `top_k` snippets (not full bodies) and `min_xrefs` floor;
+  globals processed in xref-desc order so the run can be stopped early with the
+  highest-leverage ones already done.
+- *Quality-score tuning*: `function_quality` is heuristic — keep it pure + tested
+  so weights can be adjusted without touching IDA code.
 
 ---
 

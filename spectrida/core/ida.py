@@ -243,6 +243,72 @@ def _set_func_proto(func_ea, ret_type, arg_specs):
         done["arg_types"] += sum(1 for k in intended if k != "ret")
     return done
 
+def _struct_evidence(cf, var_vec_idx):
+    # F — harvest field-access evidence for the lvar at vector index *var_vec_idx*.
+    # Walks the ctree for dereferences of that base pointer: *(T*)(var+off),
+    # var[idx], var->field. Returns [{offset,size,kind}], kind ∈ read/write/deref.
+    import ida_hexrays
+    ev = []
+
+    def _resolve(addr_expr):
+        # operand of a '*' deref → constant offset if it references our var, else None
+        a = addr_expr
+        while a is not None and a.op == ida_hexrays.cot_cast:
+            a = a.x
+        if a is None:
+            return None
+        if a.op == ida_hexrays.cot_var and a.v.idx == var_vec_idx:
+            return 0
+        if a.op == ida_hexrays.cot_add:
+            x = a.x; y = a.y
+            while x is not None and x.op == ida_hexrays.cot_cast:
+                x = x.x
+            if (x is not None and x.op == ida_hexrays.cot_var and x.v.idx == var_vec_idx
+                    and y is not None and y.op == ida_hexrays.cot_num):
+                try:
+                    return int(y.numval())
+                except Exception:
+                    return None
+        return None
+
+    def _emit(off, et, kind):
+        try:
+            sz = int(et.get_size()) if et is not None else 0
+            is_ptr = bool(et.is_ptr()) if et is not None else False
+        except Exception:
+            sz, is_ptr = 0, False
+        if sz and 0 < sz <= 0x1000:
+            ev.append({"offset": int(off), "size": sz,
+                       "kind": "deref" if is_ptr else kind})
+
+    class _V(ida_hexrays.ctree_visitor_t):
+        def __init__(self):
+            ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+        def visit_expr(self, e):
+            try:
+                if e.op == ida_hexrays.cot_asg and e.x is not None and e.x.op == ida_hexrays.cot_ptr:
+                    off = _resolve(e.x.x)
+                    if off is not None:
+                        _emit(off, e.x.type, "write")
+                if e.op == ida_hexrays.cot_ptr:
+                    off = _resolve(e.x)
+                    if off is not None:
+                        _emit(off, e.type, "read")
+                elif e.op == ida_hexrays.cot_memptr:
+                    x = e.x
+                    while x is not None and x.op == ida_hexrays.cot_cast:
+                        x = x.x
+                    if x is not None and x.op == ida_hexrays.cot_var and x.v.idx == var_vec_idx:
+                        _emit(int(e.m), e.type, "read")
+            except Exception:
+                pass
+            return 0
+    try:
+        _V().apply_to(cf.body, None)
+    except Exception:
+        pass
+    return ev
+
 emit({"ok": True, "result": "ready"})
 for line in sys.stdin:
     line = line.strip()
@@ -444,6 +510,71 @@ for line in sys.stdin:
                 emit({"ok": True, "result": {"propagated": propagated, "callers": ncallers}})
             except Exception as e:
                 emit({"ok": False, "error": "propagate_ret: %s" % e})
+        elif cmd == "struct_evidence":
+            # F — collect field-access evidence for parameter #arg_index of a
+            # function: the offsets/sizes/kinds at which that pointer is deref'd.
+            try:
+                import ida_hexrays
+                addr = _norm(a["address"]); arg_index = int(a.get("arg_index", 0))
+                cf = idaapi.decompile(addr)
+                if not cf:
+                    emit({"ok": True, "result": {"evidence": [], "snippet": "",
+                                                 "var_name": "", "var_type": ""}})
+                else:
+                    # find the vector index + name of the arg at positional arg_index
+                    lvs = cf.get_lvars()
+                    vec_idx = -1; vname = ""; vtype = ""; seen_args = 0
+                    for i in range(lvs.size()):
+                        lv = lvs[i]
+                        if lv.is_arg_var:
+                            if seen_args == arg_index:
+                                vec_idx = i; vname = lv.name
+                                try: vtype = str(lv.type())
+                                except Exception: vtype = ""
+                                break
+                            seen_args += 1
+                    ev = _struct_evidence(cf, vec_idx) if vec_idx >= 0 else []
+                    # a few pseudocode lines mentioning the var, as naming context
+                    snippet = ""
+                    if vname:
+                        keep = [ln for ln in str(cf).splitlines()
+                                if _re_t.search(r"\b%s\b" % _re_t.escape(vname), ln)]
+                        snippet = "\n".join(keep[:24])
+                    emit({"ok": True, "result": {"evidence": ev, "snippet": snippet,
+                                                 "var_name": vname, "var_type": vtype}})
+            except Exception as e:
+                emit({"ok": False, "error": "struct_evidence: %s" % e})
+        elif cmd == "make_struct":
+            # F — register a recovered struct from a prebuilt C declaration. The
+            # host (core.structs.struct_decl) computes the exact layout; we just
+            # parse it into the type library and verify it now exists.
+            try:
+                import ida_typeinf
+                name = a["name"]; decl = a["decl"]
+                errs = idc.parse_decls(decl, idc.PT_SIL)
+                ok = (errs == 0) and _type_exists(name)
+                emit({"ok": True, "result": {"ok": bool(ok), "name": name,
+                                             "errors": int(errs),
+                                             "dropped": [] if ok else
+                                             [{"var": name, "type": "struct",
+                                               "reason": "parse_failed" if errs else "not_registered"}]}})
+            except Exception as e:
+                emit({"ok": False, "error": "make_struct: %s" % e})
+        elif cmd == "apply_struct":
+            # F — set parameter #arg_index of a function to the recovered struct
+            # pointer type, via the prototype (name preserved, type validated +
+            # read-back verified by _set_func_proto).
+            try:
+                addr = _norm(a["address"]); arg_index = int(a.get("arg_index", 0))
+                ty = a.get("type", "")
+                pd = _set_func_proto(addr, "", {arg_index: {"type": ty}})
+                applied = pd.get("arg_types", 0) > 0
+                if applied:
+                    idc.save_database("")
+                emit({"ok": True, "result": {"applied": bool(applied),
+                                             "dropped": pd.get("dropped", [])}})
+            except Exception as e:
+                emit({"ok": False, "error": "apply_struct: %s" % e})
         elif cmd == "func_meta":
             # extra naming hints: compact RE facts that help the model name and type
             # the function without dumping unbounded disassembly into the prompt.
@@ -1088,6 +1219,41 @@ async def propagate_ret(ida: IDAHandle, address: str | int) -> dict:
         return result
     except Exception:
         return {"propagated": 0, "callers": 0}
+
+
+async def struct_evidence(ida: IDAHandle, address: str | int, arg_index: int = 0) -> dict:
+    """Harvest field-access evidence for parameter *arg_index* of a function.
+
+    Returns {"evidence": [{offset,size,kind}], "snippet": str, "var_name": str,
+    "var_type": str}. Empty when there's no decompiler or no such argument."""
+    try:
+        return await ida.call("struct_evidence", address=_hex(address), arg_index=arg_index)
+    except Exception:
+        return {"evidence": [], "snippet": "", "var_name": "", "var_type": ""}
+
+
+async def make_struct(ida: IDAHandle, name: str, decl: str) -> dict:
+    """Register a recovered struct from a C declaration. Returns
+    {"ok": bool, "name": str, "errors": int, "dropped": [...]}."""
+    try:
+        result = await ida.call("make_struct", name=name, decl=decl)
+        if result.get("ok"):
+            await ida.call("save")
+        return result
+    except Exception as e:
+        return {"ok": False, "name": name, "errors": -1,
+                "dropped": [{"var": name, "type": "struct", "reason": str(e)}]}
+
+
+async def apply_struct(ida: IDAHandle, address: str | int, arg_index: int,
+                       type_str: str) -> dict:
+    """Set parameter *arg_index* of the function to *type_str* (the recovered
+    ``Struct *``). Returns {"applied": bool, "dropped": [...]}."""
+    try:
+        return await ida.call("apply_struct", address=_hex(address),
+                              arg_index=arg_index, type=type_str)
+    except Exception:
+        return {"applied": False, "dropped": []}
 
 
 def _hex(address: str | int) -> str:

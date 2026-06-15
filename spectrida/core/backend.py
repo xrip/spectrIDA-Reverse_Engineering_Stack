@@ -32,6 +32,10 @@ class Backend:
     async def get_func_meta(self, addr) -> dict: ...
     async def rename_lvars(self, addr, names: dict, ret_type: str = "") -> dict: ...
     async def propagate_ret(self, addr) -> dict: ...
+    async def struct_evidence(self, addr, arg_index: int = 0) -> dict: ...
+    async def make_struct(self, name: str, decl: str) -> dict: ...
+    async def apply_struct(self, addr, arg_index: int, type_str: str) -> dict: ...
+    async def name_struct(self, layout: list[dict], snippets: str, glossary: str = "") -> dict: ...
     async def name_variables(self, pseudocode: str, lvars: list[dict]) -> dict: ...
     async def correct_types(self, pseudocode: str, failed: list[dict]) -> dict: ...
     async def name_function_staged(self, pseudocode, lvars, callees, callers,
@@ -92,6 +96,18 @@ class RealBackend(Backend):
 
     async def propagate_ret(self, addr):
         return await _ida.propagate_ret(self._ida, addr)
+
+    async def struct_evidence(self, addr, arg_index=0):
+        return await _ida.struct_evidence(self._ida, addr, arg_index)
+
+    async def make_struct(self, name, decl):
+        return await _ida.make_struct(self._ida, name, decl)
+
+    async def apply_struct(self, addr, arg_index, type_str):
+        return await _ida.apply_struct(self._ida, addr, arg_index, type_str)
+
+    async def name_struct(self, layout, snippets, glossary=""):
+        return await _llamacpp.name_struct(layout, snippets, glossary=glossary)
 
     async def name_variables(self, pseudocode, lvars):
         return await _llamacpp.name_variables(pseudocode, lvars)
@@ -155,6 +171,19 @@ class DemoBackend(Backend):
 
     async def propagate_ret(self, addr):
         return _demo.propagate_ret(addr)
+
+    async def struct_evidence(self, addr, arg_index=0):
+        return _demo.struct_evidence(addr, arg_index)
+
+    async def make_struct(self, name, decl):
+        return _demo.make_struct(name, decl)
+
+    async def apply_struct(self, addr, arg_index, type_str):
+        return _demo.apply_struct(addr, arg_index, type_str)
+
+    async def name_struct(self, layout, snippets, glossary=""):
+        return _demo.name_struct(layout, snippets, glossary=glossary)
+
     async def name_variables(self, pseudocode, lvars):
         return _demo.name_variables(pseudocode, lvars)
 
