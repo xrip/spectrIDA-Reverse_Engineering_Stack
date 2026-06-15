@@ -14,6 +14,44 @@ from spectrida.core import ida as _ida
 from spectrida.core import llamacpp as _llamacpp
 
 
+def format_local_types(ltypes: dict, *, max_structs: int = 160,
+                       max_enums: int = 80) -> str:
+    """Render the binary's user-defined struct/enum library as a compact line for
+    the (cached) system prompt: ``Name(Nf,0xSize)`` per struct, ``Name(Mm,0xSize)``
+    per enum. The field/member count + size let the model pick the type that fits a
+    given access pattern without us pasting every full definition. Returns "" when
+    there are no user types. Tolerates the legacy name-only (str) entry form.
+    """
+    structs = ltypes.get("structs", []) or []
+    enums = ltypes.get("enums", []) or []
+    if not structs and not enums:
+        return ""
+
+    def _fmt(entry, count_key: str, suffix: str) -> str:
+        if isinstance(entry, str):
+            return entry
+        name = entry.get("name", "")
+        n = entry.get(count_key, -1)
+        sz = entry.get("size", 0)
+        bits = []
+        if isinstance(n, int) and n >= 0:
+            bits.append(f"{n}{suffix}")
+        if sz:
+            bits.append(f"{sz:#x}")
+        return name + (f"({','.join(bits)})" if bits else "")
+
+    lines = ["User-defined types in this binary - name(field/member count, "
+             "byte size). Prefer these when typing parameters, variables and "
+             "struct fields; pick the one whose size/shape matches the access:"]
+    if structs:
+        lines.append("  Structs/unions: "
+                     + ", ".join(_fmt(s, "fields", "f") for s in structs[:max_structs]))
+    if enums:
+        lines.append("  Enums: "
+                     + ", ".join(_fmt(e, "members", "m") for e in enums[:max_enums]))
+    return "\n".join(lines)
+
+
 class Backend:
     title: str = ""
     demo: bool = False
@@ -64,15 +102,9 @@ class RealBackend(Backend):
         # and can apply them when assigning parameter / variable types.
         try:
             ltypes = await _ida.get_local_types(self._ida)
-            structs = ltypes.get("structs", [])
-            enums   = ltypes.get("enums",   [])
-            if structs or enums:
-                parts = [ctx.rstrip(), "\nUser-defined types in this binary:"]
-                if structs:
-                    parts.append("  Structs/unions: " + ", ".join(structs[:120]))
-                if enums:
-                    parts.append("  Enums: " + ", ".join(enums[:60]))
-                ctx = "\n".join(parts)
+            block = format_local_types(ltypes)
+            if block:
+                ctx = ctx.rstrip() + "\n\n" + block
         except Exception:
             pass
         _llamacpp.set_binary_context(ctx)

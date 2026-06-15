@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TypedDict
 
 from spectrida.config import (
+    audit_log_enabled,
     global_naming_enabled,
     name_cache_enabled,
     name_lint_enabled,
@@ -31,10 +32,13 @@ from spectrida.config import (
     type_retry_enabled,
 )
 from spectrida.core import namecache
+from spectrida.core.audit import AuditLog
 from spectrida.core.canon import build_preferences, canonical_name
 from spectrida.core.globals import rank_globals
 from spectrida.core.structs import (
     merge_field_names,
+    merge_layouts,
+    real_fields,
     reconcile_fields,
     struct_decl,
     struct_signature,
@@ -122,6 +126,12 @@ _GENERIC_NAMES = frozenset({
 })
 
 
+# A shape this many fields or richer may be reused for a *different* pointer by
+# signature alone. Below it, two unrelated 2-field structs collide too easily, so
+# we never cross-assign one to the other (anti over-merge).
+_STRUCT_REUSE_MIN_FIELDS = 4
+
+
 def _struct_candidate_type(ty: str) -> bool:
     """A parameter type worth trying to recover a struct for: a *generic* pointer
     (or pointer-width scalar) that doesn't already name a known struct/enum. We
@@ -192,6 +202,11 @@ class IDADatabase:
         self._cache = NameCache(enabled=name_cache_enabled())
         self._cache_loaded = False
         self._structs_by_sig: dict[str, str] = {}   # F: layout signature → struct name
+        self._struct_layouts: dict[str, list[dict]] = {}  # F: struct name → accumulated layout
+        self._structs_loaded = False
+        self._structs_dirty = False
+        self._audit = AuditLog(enabled=audit_log_enabled())
+        self._audit_loaded = False
 
     async def _ensure_cache_loaded(self) -> None:
         """Load the on-disk naming cache (next to the .i64) once."""
@@ -201,6 +216,76 @@ class IDADatabase:
         i64 = getattr(self._b, "i64", None)
         if i64 and self._cache.enabled:
             self._cache.load(str(i64) + ".spectrida-namecache.json")
+
+    def _structs_path(self) -> str | None:
+        i64 = getattr(self._b, "i64", None)
+        return (str(i64) + ".spectrida-structs.json") if i64 else None
+
+    def _ensure_structs_loaded(self) -> None:
+        """Load the accumulated recovered-struct layouts (name → fields) once, and
+        rebuild the signature index so re-runs MERGE into the existing structs
+        instead of clobbering them with a smaller per-function slice."""
+        if self._structs_loaded:
+            return
+        self._structs_loaded = True
+        p = self._structs_path()
+        if not p:
+            return
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            layouts = data.get("structs", {}) if isinstance(data, dict) else {}
+            if isinstance(layouts, dict):
+                self._struct_layouts = {k: v for k, v in layouts.items()
+                                        if isinstance(v, list)}
+                for name, layout in self._struct_layouts.items():
+                    self._structs_by_sig[struct_signature(layout)] = name
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass            # corrupt store → start fresh, never fatal
+
+    def _save_structs(self) -> None:
+        if not self._structs_dirty:
+            return
+        p = self._structs_path()
+        if not p:
+            return
+        try:
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "structs": self._struct_layouts}, f)
+            import os as _os
+            _os.replace(tmp, p)
+            self._structs_dirty = False
+        except Exception:
+            pass
+
+    def _ensure_audit_loaded(self) -> None:
+        """Bind the audit journal to ``<i64>.spectrida-audit.jsonl`` once (loading
+        prior history). Demo has no i64 → in-memory only."""
+        if self._audit_loaded:
+            return
+        self._audit_loaded = True
+        i64 = getattr(self._b, "i64", None)
+        if i64 and self._audit.enabled:
+            self._audit.open(str(i64) + ".spectrida-audit.jsonl")
+
+    def _record(self, op: str, **kw) -> None:
+        self._ensure_audit_loaded()
+        self._audit.record(op, **kw)
+
+    def _record_changes(self, changes: list[dict], *, ea=None) -> None:
+        if not changes:
+            return
+        self._ensure_audit_loaded()
+        self._audit.record_changes(changes, ea=ea)
+
+    @property
+    def audit(self) -> AuditLog:
+        """The project change journal (review / export a revert script)."""
+        self._ensure_audit_loaded()
+        return self._audit
 
     async def _ensure_glossary_seed(self) -> None:
         """Seed the project glossary from already-named functions, once."""
@@ -239,13 +324,19 @@ class IDADatabase:
     async def rename(self, address: int | str, new_name: str) -> str | bool:
         """Rename the function at *address*. Returns the actual name used (may
         differ from new_name if deduplicated), or False on failure."""
+        a = address if isinstance(address, int) else int(address, 16)
+        old_name = ""
+        if self._funcs:
+            old_name = next((f["name"] for f in self._funcs if f["start"] == a), "")
         result = await self._b.rename(address, new_name)
         actual = result if isinstance(result, str) else (new_name if result else "")
-        if actual and self._funcs:
-            a = address if isinstance(address, int) else int(address, 16)
-            for f in self._funcs:
-                if f["start"] == a:
-                    f["name"] = actual
+        if actual:
+            if old_name != actual:
+                self._record("rename_func", ea=a, old=old_name, new=actual)
+            if self._funcs:
+                for f in self._funcs:
+                    if f["start"] == a:
+                        f["name"] = actual
         return result
 
     # ── AI naming ───────────────────────────────────────────────────────────
@@ -362,6 +453,7 @@ class IDADatabase:
 
         if rename:
             result = await self._b.rename_lvars(a, mapping)
+            self._record_changes(result.get("changes"), ea=a)
             return {"mapping": mapping,
                     "renamed": result.get("renamed", 0),
                     "retyped": result.get("retyped", 0),
@@ -514,6 +606,7 @@ class IDADatabase:
                 applied_ret = r.get("ret_type", "")
                 dropped = r.get("dropped", []) or []
                 pseudocode = r.get("pseudocode", pseudocode)
+                self._record_changes(r.get("changes"), ea=a)
 
                 # E-2: one corrective retry for types rejected as unknown_type —
                 # ask the model for a replacement from existing/primitive types.
@@ -530,6 +623,7 @@ class IDADatabase:
                         if fix_map or fix_ret:
                             r2 = await self._b.rename_lvars(a, fix_map, ret_type=fix_ret)
                             retyped_vars += r2.get("retyped", 0)
+                            self._record_changes(r2.get("changes"), ea=a)
                             if fix_ret and r2.get("ret_type"):
                                 applied_ret = applied_ret or fix_ret
                             pseudocode = r2.get("pseudocode", pseudocode)
@@ -547,6 +641,7 @@ class IDADatabase:
             try:
                 pr = await self._b.propagate_ret(a)
                 propagated = pr.get("propagated", 0)
+                self._record_changes(pr.get("changes"))
             except Exception:
                 propagated = 0
 
@@ -586,27 +681,46 @@ class IDADatabase:
         types → register the struct in IDA → set the parameter to ``Struct *``.
         Offsets/sizes come only from observed accesses, never the model.
 
-        Structurally identical pointers (same offset/size shape) reuse a single
-        recovered struct (`struct_signature` dedup), so clones collapse.
+        A struct's full shape is the UNION of how it's dereferenced across every
+        function that receives it. So recoveries are accumulated **by name**: a
+        function that resolves to an already-recovered struct merges its observed
+        fields into that struct's layout (widest-access-wins) and the struct is
+        redefined with the superset — field count only grows, the richest layout is
+        never clobbered by a later per-function slice. The accumulated layouts
+        persist next to the .i64, so a second `F` pass keeps refining.
 
-        Returns ``{ok, struct, fields, applied, reused, dropped, reason}``.
+        Returns ``{ok, struct, fields, added, applied, reused, grew, new_struct,
+        dropped, reason}`` where *fields* is the struct's TOTAL field count after
+        the merge and *added* is what this call contributed.
         """
         a = address if isinstance(address, int) else int(address, 16)
+        self._ensure_structs_loaded()
         ev = await self._b.struct_evidence(a, arg_index)
         layout = reconcile_fields(ev.get("evidence", []))
-        real = [f for f in layout if "padding" not in (f.get("flags") or [])]
+        real = real_fields(layout)
         if len(real) < min_fields:
             return {"ok": False, "reason": "too_few_fields", "struct": "",
-                    "fields": len(real), "applied": False, "reused": False,
+                    "fields": len(real), "added": 0, "applied": False,
+                    "reused": False, "grew": False, "new_struct": False,
                     "dropped": []}
 
         await self._ensure_glossary_seed()
         sig = struct_signature(layout)
-        reused = sig in self._structs_by_sig
         dropped: list[dict] = []
 
-        if reused:
+        # 1. choose the target struct name.
+        #    a) the param is already typed as a struct WE recovered → merge into it
+        #       (this is what lets a 2nd F pass refine already-typed params);
+        #    b) a rich shape matches a known signature → reuse that struct;
+        #    c) otherwise the model names a (possibly new) struct.
+        cur_idents = [i for i in extract_type_identifiers(ev.get("var_type", ""))
+                      if i in self._struct_layouts]
+        reused = False
+        if cur_idents:
+            name = cur_idents[0]
+        elif len(real) >= _STRUCT_REUSE_MIN_FIELDS and sig in self._structs_by_sig:
             name = self._structs_by_sig[sig]
+            reused = True
         else:
             named = await self._b.name_struct(
                 layout, ev.get("snippet", ""), glossary=self._glossary.render())
@@ -617,25 +731,43 @@ class IDADatabase:
                              if f["start"] == a), None)
                 base = (func["name"] if func else hex(a)).replace("$$", "_")
                 name = "%s_arg%d_t" % (base, arg_index)
-            if rename:
-                decl = struct_decl(name, layout)
-                mk = await self._b.make_struct(name, decl)
-                if not mk.get("ok"):
-                    return {"ok": False, "reason": "make_failed", "struct": name,
-                            "fields": len(real), "applied": False, "reused": False,
-                            "dropped": mk.get("dropped", [])}
+
+        # 2. merge this slice into the struct's accumulated layout.
+        prev = self._struct_layouts.get(name)
+        merged = merge_layouts(prev, layout)
+        total = len(real_fields(merged))
+        new_struct = prev is None
+        grew = new_struct or total > len(real_fields(prev))
+        added = total - (0 if new_struct else len(real_fields(prev)))
+
+        # 3. (re)define the struct only when it actually changed.
+        if rename and grew:
+            decl = struct_decl(name, merged)
+            mk = await self._b.make_struct(name, decl)
+            if not mk.get("ok"):
+                return {"ok": False, "reason": "make_failed", "struct": name,
+                        "fields": len(real), "added": 0, "applied": False,
+                        "reused": False, "grew": False, "new_struct": new_struct,
+                        "dropped": mk.get("dropped", [])}
+            self._record("make_struct", ea=a, new=name, extra=f"{total} fields")
+
+        self._struct_layouts[name] = merged
+        self._structs_dirty = True
+        self._structs_by_sig[struct_signature(merged)] = name
+        if len(real) >= _STRUCT_REUSE_MIN_FIELDS:
             self._structs_by_sig[sig] = name
-            self._glossary.add_term(name)
+        self._glossary.add_term(name)
 
         applied = False
         if rename:
             ap = await self._b.apply_struct(a, arg_index, name + " *")
             applied = bool(ap.get("applied"))
             dropped = ap.get("dropped", []) or []
+            self._record_changes(ap.get("changes"), ea=a)
 
-        return {"ok": True, "struct": name, "fields": len(real),
-                "applied": applied, "reused": reused, "dropped": dropped,
-                "reason": ""}
+        return {"ok": True, "struct": name, "fields": total, "added": added,
+                "applied": applied, "reused": reused, "grew": grew,
+                "new_struct": new_struct, "dropped": dropped, "reason": ""}
 
     async def recover_structs(
         self,
@@ -665,6 +797,7 @@ class IDADatabase:
         if rename and not struct_recovery_enabled():
             return {"functions": 0, "structs": 0, "fields": 0, "applied": 0,
                     "reused": 0, "dropped": 0}
+        self._ensure_structs_loaded()
         funcs = await self.list_functions()
         if scope == "named":
             targets = [f for f in funcs if not f["name"].lower().startswith("sub_")]
@@ -672,8 +805,18 @@ class IDADatabase:
             targets = list(funcs)
         targets = targets[:limit]
 
+        def _recoverable(ty: str) -> bool:
+            # a generic pointer, OR a param already typed as one of OUR recovered
+            # structs (so a repeat pass keeps merging in newly-seen fields) — but
+            # never a real, pre-existing named type from the type library.
+            if _struct_candidate_type(ty):
+                return True
+            return any(i in self._struct_layouts
+                       for i in extract_type_identifiers(ty))
+
         totals = {"functions": 0, "structs": 0, "fields": 0, "applied": 0,
-                  "reused": 0, "dropped": 0}
+                  "reused": 0, "merged": 0, "dropped": 0}
+        distinct: set[str] = set()
         total = len(targets)
         for fi, f in enumerate(targets):
             info = await self._b.get_lvars(f["start"])
@@ -681,17 +824,19 @@ class IDADatabase:
             items: list[dict] = []
             recovered_here = False
             for idx, lv in enumerate(args):
-                if not _struct_candidate_type(lv.get("type", "")):
+                if not _recoverable(lv.get("type", "")):
                     continue
                 r = await self.recover_struct(f["start"], idx,
                                               min_fields=min_fields, rename=rename)
                 items.append({"arg": idx, "var": lv.get("name", ""), "result": r})
                 if r.get("ok"):
                     recovered_here = True
-                    totals["structs"] += 1
-                    totals["fields"] += r.get("fields", 0)
+                    distinct.add(r.get("struct", ""))
+                    totals["fields"] += r.get("added", 0)   # NEW fields contributed
                     totals["applied"] += 1 if r.get("applied") else 0
                     totals["reused"] += 1 if r.get("reused") else 0
+                    if r.get("grew") and not r.get("new_struct"):
+                        totals["merged"] += 1
                 totals["dropped"] += len(r.get("dropped") or [])
             if recovered_here:
                 totals["functions"] += 1
@@ -700,6 +845,8 @@ class IDADatabase:
             if progress_cb:
                 await progress_cb(fi + 1, total,
                                   {"func": f["name"], "addr": f["start"], "items": items})
+        totals["structs"] = len(distinct)
+        self._save_structs()
         return totals
 
     # ── global variable naming + typing (G) ───────────────────────────────────
@@ -788,6 +935,7 @@ class IDADatabase:
                     totals["typed"] += 1
                 dropped = r.get("dropped", []) or []
                 totals["dropped"] += len(dropped)
+                self._record_changes(r.get("changes"), ea=ea)
                 # grow the glossary so later globals/functions reuse the vocabulary
                 if applied_name:
                     self._glossary.add_name(ea, applied_name)
@@ -1272,23 +1420,26 @@ class IDADatabase:
         return out
 
     def save_cache(self) -> None:
-        """Flush the naming cache to disk WITHOUT closing the backend.
+        """Flush the naming cache + recovered-struct store to disk WITHOUT closing
+        the backend.
 
         The TUI keeps one long-lived IDADatabase and never calls close() (the
         backend outlives any single action), so it calls this after each AI action
-        to persist newly-cached names instead of relying on the periodic
-        ``maybe_save`` threshold or the close-time save it never reaches.
+        to persist newly-cached names / merged struct layouts instead of relying on
+        the periodic ``maybe_save`` threshold or the close-time save it never reaches.
         """
         try:
             self._cache.save()
         except Exception:
             pass
+        self._save_structs()
 
     async def close(self) -> None:
         try:
             self._cache.save()
         except Exception:
             pass
+        self._save_structs()
         await self._b.close()
 
 

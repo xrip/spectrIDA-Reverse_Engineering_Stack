@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- **Struct recovery now accumulates instead of clobbering.** Different functions
+  dereference a struct at different offsets, so each recovery saw only a slice —
+  and because they were redefined under the same model-chosen name, a later
+  2-field slice would *overwrite* an earlier 22-field one in the type library. Now
+  recoveries are merged **by name**: each new slice is unioned into the struct's
+  accumulated layout (widest-access-wins, meaningful names/types preferred), the
+  struct is redefined with the **superset**, and the field count only grows. The
+  accumulated layouts persist next to the .i64 (`<i64>.spectrida-structs.json`), so
+  a second `F` pass keeps refining — and `F` now **re-enters parameters already
+  typed with one of its own recovered structs** (not just generic pointers), while
+  still never touching real, pre-existing library types. Anti-collision: a shape
+  must have ≥4 fields before it can be reused for a *different* pointer by
+  signature alone, so two unrelated 2-field structs no longer cross-assign. The
+  `F` log now shows `new` / `+N merged` / `reused` per function and the running
+  field total.
+- **Richer type catalogue in the prompt.** The user-defined struct/enum list fed
+  to the model (used when typing parameters/variables in `V`, `T`, `B`, …) now
+  carries each type's **field/member count and byte size** —
+  `Player(12f,0x148)`, `EntityState(6m,0x4)` — so the model can pick the struct
+  whose size/shape matches a given access instead of guessing from the name alone.
+  Structs are listed richest-first (most fields) so truncation drops the trivial
+  tail. It rides in the cached system prefix (computed once per session), so the
+  cost is one-time, not per request. Pure renderer `backend.format_local_types`.
+- **Project change journal + revert (`A`).** Every mutation the tool makes —
+  function renames, variable/param rename + type, return types, prototype args,
+  global name/type, struct creation + application, return-type propagation — is now
+  recorded to an append-only `<i64>.spectrida-audit.jsonl` with the address, op,
+  and **previous → new** value, written and flushed the moment it happens (crash-
+  safe, survives across sessions). Press `A` to view the journal (newest first) and
+  auto-export an IDAPython **revert script** (`<i64>.spectrida-revert.py`): names
+  (function/var/global), global types and struct creations are reverted exactly;
+  lvar/arg/prototype type reverts are emitted as annotated comments carrying the
+  old value for manual application. Programmatic access via `db.audit`. Worker
+  mutation commands now report the old value alongside each change. Kill switch
+  `SPECTRIDA_AUDIT_LOG=0`.
 - **Globals are cached too; the cache is actually persisted.** The
   content-addressed name cache now stores **global** naming results
   (`{name, type}`) keyed by the global's size/type + its ranked use sites

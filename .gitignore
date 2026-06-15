@@ -24,6 +24,9 @@ venv/
 # spectrIDA runtime output
 output/
 *.spectrida-namecache.json
+*.spectrida-structs.json
+*.spectrida-audit.jsonl
+*.spectrida-revert.py
 
 # env / secrets
 .env

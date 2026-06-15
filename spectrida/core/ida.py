@@ -180,7 +180,7 @@ def _set_func_proto(func_ea, ret_type, arg_specs):
     # Returns {"ret":0/1, "arg_types":N, "arg_names":M, "dropped":[{var,type,reason}]}
     # — counts reflect only types VERIFIED via read-back after apply_tinfo.
     import ida_typeinf, idaapi
-    done = {"ret": 0, "arg_types": 0, "arg_names": 0, "dropped": []}
+    done = {"ret": 0, "arg_types": 0, "arg_names": 0, "dropped": [], "changes": []}
 
     def _drop(idx, ty, reason):
         if idx == "ret":
@@ -212,10 +212,12 @@ def _set_func_proto(func_ea, ret_type, arg_specs):
 
     changed = False
     intended = {}  # idx (or "ret") -> intended type string, for read-back verify
+    olds = {}      # idx (or "ret") -> old type string, for the audit log
     if ret_type:
         rt, reason = _classify_type(ret_type)
         if rt is not None:
-            fi.rettype = rt; intended["ret"] = ret_type; changed = True
+            olds["ret"] = str(fi.rettype); fi.rettype = rt
+            intended["ret"] = ret_type; changed = True
         else:
             _drop("ret", ret_type, reason)
     n = fi.size()
@@ -228,10 +230,15 @@ def _set_func_proto(func_ea, ret_type, arg_specs):
         if ty:
             at, reason = _classify_type(ty)
             if at is not None:
-                fi[idx].type = at; intended[idx] = ty; changed = True
+                olds[idx] = str(fi[idx].type); fi[idx].type = at
+                intended[idx] = ty; changed = True
             else:
                 _drop(idx, ty, reason)
         if nm and nm.isidentifier():
+            old_an = fi[idx].name or ("a%d" % (idx + 1))
+            if nm != old_an:
+                done["changes"].append({"op": "rename_arg", "target": str(idx),
+                                        "old": old_an, "new": nm})
             fi[idx].name = nm; done["arg_names"] += 1; changed = True
 
     if not changed:
@@ -244,24 +251,34 @@ def _set_func_proto(func_ea, ret_type, arg_specs):
             _drop(idx, ty, "apply_failed")
         return {"ret": 0, "arg_types": 0, "arg_names": 0, "dropped": done["dropped"]}
 
+    def _chg(idx, new_ty):
+        if idx == "ret":
+            done["changes"].append({"op": "func_ret", "old": olds.get("ret", ""),
+                                    "new": new_ty})
+        else:
+            done["changes"].append({"op": "func_arg", "target": "arg%d" % idx,
+                                    "old": olds.get(idx, ""), "new": new_ty})
+
     # read back and verify each intended type actually stuck
     v = ida_typeinf.tinfo_t(); fi2 = ida_typeinf.func_type_data_t()
     if idaapi.get_tinfo(v, func_ea) and v.is_func() and v.get_func_details(fi2):
         for idx, ty in intended.items():
             if idx == "ret":
                 if _ty_match(str(fi2.rettype), ty):
-                    done["ret"] = 1
+                    done["ret"] = 1; _chg("ret", ty)
                 else:
                     _drop("ret", ty, "verify_mismatch")
             elif idx < fi2.size() and _ty_match(str(fi2[idx].type), ty):
-                done["arg_types"] += 1
+                done["arg_types"] += 1; _chg(idx, ty)
             else:
                 _drop(idx, ty, "verify_mismatch")
     else:
         # couldn't read back — trust the successful apply
         if "ret" in intended:
-            done["ret"] = 1
-        done["arg_types"] += sum(1 for k in intended if k != "ret")
+            done["ret"] = 1; _chg("ret", intended["ret"])
+        for k, ty in intended.items():
+            if k != "ret":
+                done["arg_types"] += 1; _chg(k, ty)
     return done
 
 def _struct_evidence(cf, var_vec_idx):
@@ -389,7 +406,7 @@ for line in sys.stdin:
                 import ida_hexrays
                 addr = _norm(a["address"]); mapping = a.get("names", {}); ret_type = a.get("ret_type", "")
                 cf = idaapi.decompile(addr)
-                renamed = 0; retyped = 0; dropped = []
+                renamed = 0; retyped = 0; dropped = []; changes = []
                 if cf:
                     func_ea = cf.entry_ea
                     # normalize legacy flat form → {old: {"name","type"}}
@@ -431,15 +448,23 @@ for line in sys.stdin:
                                 continue
                             new = spec["name"]; ty = spec["type"]
                             cur = lv.name
+                            old_lt = ""
+                            try: old_lt = str(lv.type())
+                            except Exception: old_lt = ""
                             if new and new != lv.name and new.isidentifier():
                                 if ida_hexrays.rename_lvar(func_ea, lv.name, new):
-                                    renamed += 1; cur = new
+                                    renamed += 1
+                                    changes.append({"op": "rename_var", "target": lv.name,
+                                                    "old": lv.name, "new": new})
+                                    cur = new
                             if ty:
                                 tif, reason = _classify_type(ty)
                                 if tif is None:
                                     dropped.append({"var": cur, "type": ty, "reason": reason})
                                 elif _set_lvar_type(func_ea, cur, tif):
                                     retyped += 1
+                                    changes.append({"op": "retype_var", "target": cur,
+                                                    "old": old_lt, "new": ty})
                                 else:
                                     dropped.append({"var": cur, "type": ty, "reason": "apply_failed"})
                     # function prototype: return type + arg names/types
@@ -447,14 +472,15 @@ for line in sys.stdin:
                     renamed += min(arg_renames, pd["arg_names"])
                     retyped += pd["ret"] + pd["arg_types"]
                     dropped.extend(pd.get("dropped", []))
+                    changes.extend(pd.get("changes", []))
                     cf2 = idaapi.decompile(addr)
                     emit({"ok": True, "result": {"renamed": renamed, "retyped": retyped,
                                                  "ret_type": ret_type if pd["ret"] else "",
-                                                 "dropped": dropped,
+                                                 "dropped": dropped, "changes": changes,
                                                  "pseudocode": str(cf2) if cf2 else ""}})
                 else:
                     emit({"ok": True, "result": {"renamed": 0, "retyped": 0, "ret_type": "",
-                                                 "dropped": [], "pseudocode": ""}})
+                                                 "dropped": [], "changes": [], "pseudocode": ""}})
             except Exception as e:
                 emit({"ok": False, "error": "rename_lvars: %s" % e})
         elif cmd == "protos":
@@ -480,7 +506,7 @@ for line in sys.stdin:
                         rt = fd.rettype
                 interesting = bool(rt is not None and not rt.is_void()
                                    and (rt.is_ptr() or rt.is_udt() or rt.is_enum()))
-                propagated = 0; ncallers = 0
+                propagated = 0; ncallers = 0; changes = []
                 _GENERIC = {"__int64", "unsigned __int64", "int", "unsigned int",
                             "__int32", "unsigned __int32", "_DWORD", "_QWORD",
                             "_BYTE", "_OWORD", "void *", "char *", "__int64 *",
@@ -524,11 +550,17 @@ for line in sys.stdin:
                             if _idx < 0 or _idx >= _lvs.size():
                                 continue
                             _lv = _lvs[_idx]
-                            if str(_lv.type()) not in _GENERIC:
+                            _old_t = str(_lv.type())
+                            if _old_t not in _GENERIC:
                                 continue
                             if _set_lvar_type(_fn.start_ea, _lv.name, rt):
                                 propagated += 1
-                emit({"ok": True, "result": {"propagated": propagated, "callers": ncallers}})
+                                changes.append({"op": "propagate_ret",
+                                                "ea": hex(_fn.start_ea),
+                                                "target": _lv.name,
+                                                "old": _old_t, "new": str(rt)})
+                emit({"ok": True, "result": {"propagated": propagated,
+                                             "callers": ncallers, "changes": changes}})
             except Exception as e:
                 emit({"ok": False, "error": "propagate_ret: %s" % e})
         elif cmd == "struct_evidence":
@@ -590,10 +622,19 @@ for line in sys.stdin:
                 ty = a.get("type", "")
                 pd = _set_func_proto(addr, "", {arg_index: {"type": ty}})
                 applied = pd.get("arg_types", 0) > 0
+                # _set_func_proto already emitted a func_arg change with the old
+                # type; re-label it apply_struct so the audit reads as a struct op.
+                changes = []
+                for ch in pd.get("changes", []):
+                    if ch.get("op") == "func_arg":
+                        changes.append({"op": "apply_struct",
+                                        "target": "arg%d" % arg_index,
+                                        "old": ch.get("old", ""), "new": ty})
                 if applied:
                     idc.save_database("")
                 emit({"ok": True, "result": {"applied": bool(applied),
-                                             "dropped": pd.get("dropped", [])}})
+                                             "dropped": pd.get("dropped", []),
+                                             "changes": changes}})
             except Exception as e:
                 emit({"ok": False, "error": "apply_struct: %s" % e})
         elif cmd == "list_globals":
@@ -719,6 +760,9 @@ for line in sys.stdin:
                 import ida_typeinf
                 gea = _norm(a["address"]); nm = a.get("name", ""); ty = a.get("type", "")
                 named = ""; typed = False; dropped = []
+                old_name = idc.get_name(gea) or ""
+                try: old_type = idc.get_type(gea) or ""
+                except Exception: old_type = ""
                 if nm and nm.isidentifier():
                     use = nm
                     _ex = idc.get_name_ea_simple(use)
@@ -741,9 +785,15 @@ for line in sys.stdin:
                         else:
                             dropped.append({"var": named or nm or hex(gea), "type": ty,
                                             "reason": "verify_mismatch"})
+                changes = []
+                if named:
+                    changes.append({"op": "global_name", "old": old_name, "new": named})
+                if typed:
+                    changes.append({"op": "global_type", "old": old_type, "new": ty})
                 if named or typed:
                     idc.save_database("")
-                emit({"ok": True, "result": {"named": named, "typed": typed, "dropped": dropped}})
+                emit({"ok": True, "result": {"named": named, "typed": typed,
+                                             "dropped": dropped, "changes": changes}})
             except Exception as e:
                 emit({"ok": False, "error": "set_global: %s" % e})
         elif cmd == "func_meta":
@@ -1123,12 +1173,24 @@ for line in sys.stdin:
                         _tif = _iti.tinfo_t()
                         if not _iti.get_numbered_type(_ti, _i, _tif):
                             continue
+                        # carry field count + byte size so the model can pick the
+                        # struct/enum that fits the access pattern (cheap: this rides
+                        # in the cached system prefix, computed once per session).
+                        try: _sz = int(_tif.get_size())
+                        except Exception: _sz = 0
                         if _tif.is_struct() or _tif.is_union():
-                            _structs.append(_nm)
+                            try: _nf = int(_tif.get_udt_nmembers())
+                            except Exception: _nf = -1
+                            _structs.append({"name": _nm, "fields": _nf, "size": _sz})
                         elif _tif.is_enum():
-                            _enums.append(_nm)
+                            try: _nm_ct = int(_tif.get_enum_nmembers())
+                            except Exception: _nm_ct = -1
+                            _enums.append({"name": _nm, "members": _nm_ct, "size": _sz})
                     except Exception:
                         continue
+                # richest (most fields) first, so the long tail of trivial structs
+                # is what gets truncated, not the meaningful ones
+                _structs.sort(key=lambda s: -s.get("fields", 0))
                 emit({"ok": True, "result": {
                     "structs": _structs[:300], "enums": _enums[:150]
                 }})
@@ -1377,7 +1439,8 @@ async def rename_lvars(ida: IDAHandle, address: str | int, names: dict,
             await ida.call("save")
         return result
     except Exception:
-        return {"renamed": 0, "retyped": 0, "ret_type": "", "dropped": [], "pseudocode": ""}
+        return {"renamed": 0, "retyped": 0, "ret_type": "", "dropped": [],
+                "changes": [], "pseudocode": ""}
 
 
 async def propagate_ret(ida: IDAHandle, address: str | int) -> dict:
@@ -1389,7 +1452,7 @@ async def propagate_ret(ida: IDAHandle, address: str | int) -> dict:
             await ida.call("save")
         return result
     except Exception:
-        return {"propagated": 0, "callers": 0}
+        return {"propagated": 0, "callers": 0, "changes": []}
 
 
 async def struct_evidence(ida: IDAHandle, address: str | int, arg_index: int = 0) -> dict:
@@ -1424,7 +1487,7 @@ async def apply_struct(ida: IDAHandle, address: str | int, arg_index: int,
         return await ida.call("apply_struct", address=_hex(address),
                               arg_index=arg_index, type=type_str)
     except Exception:
-        return {"applied": False, "dropped": []}
+        return {"applied": False, "dropped": [], "changes": []}
 
 
 async def list_globals(ida: IDAHandle, min_xrefs: int = 1, limit: int = 5000) -> list[dict]:
@@ -1453,7 +1516,7 @@ async def set_global(ida: IDAHandle, address: str | int, name: str,
         return await ida.call("set_global", address=_hex(address),
                               name=name, type=type_str)
     except Exception:
-        return {"named": "", "typed": False, "dropped": []}
+        return {"named": "", "typed": False, "dropped": [], "changes": []}
 
 
 def _hex(address: str | int) -> str:

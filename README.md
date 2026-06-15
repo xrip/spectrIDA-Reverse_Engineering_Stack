@@ -139,6 +139,7 @@ spectrida onboard
 | `F` | Recover structs from field-access patterns and apply them to pointer params |
 | `G` | Name + type generic globals (`dword_*`, …) from their best use sites |
 | `L` | Lint — unify naming across the binary (`msg`/`message`, typos, …) |
+| `A` | Audit — change journal (addr · old → new) + export a revert script |
 | `O` | Overview — AI summary of the whole binary |
 | `/` | Fuzzy search |
 | `?` | Help |

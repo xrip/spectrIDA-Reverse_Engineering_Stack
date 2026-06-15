@@ -243,7 +243,10 @@ def correct_types(pseudocode: str, failed: list[dict]) -> dict:
 def propagate_ret(addr) -> dict:
     """Demo: pretend each caller has one variable that takes the result."""
     callers = xrefs_to(addr)
-    return {"propagated": len(callers), "callers": len(callers)}
+    changes = [{"op": "propagate_ret", "ea": c.get("address", ""),
+                "target": "result", "old": "__int64", "new": "void *"}
+               for c in callers]
+    return {"propagated": len(callers), "callers": len(callers), "changes": changes}
 
 
 # ── struct recovery (demo, F) ────────────────────────────────────────────────
@@ -268,13 +271,18 @@ _DEMO_STRUCT_EVIDENCE = {
 # what the (fake) model names the recovered fields, keyed by offset
 _DEMO_STRUCT_FIELDS = {0x0: ("vtable", "void *"), 0x40: ("health", "float")}
 
+# struct type applied to (func_ea, arg_index) — so a re-run sees the typed param
+# (mirrors how real IDA reports a parameter that already has a recovered struct)
+_demo_applied_struct_types: dict[tuple, str] = {}
+
 
 def struct_evidence(addr, arg_index: int = 0) -> dict:
     a = _norm(addr)
     ev = _DEMO_STRUCT_EVIDENCE.get((a, arg_index), [])
     return {"evidence": [dict(e) for e in ev],
             "snippet": _demo_state(a)["pseudocode"] if ev else "",
-            "var_name": "a%d" % (arg_index + 1), "var_type": "void *"}
+            "var_name": "a%d" % (arg_index + 1),
+            "var_type": _demo_applied_struct_types.get((a, arg_index), "void *")}
 
 
 def name_struct(layout: list[dict], snippets: str, glossary: str = "") -> dict:
@@ -299,10 +307,14 @@ def apply_struct(addr, arg_index: int, type_str: str) -> dict:
     from spectrida.core.types import extract_type_identifiers
     for ident in extract_type_identifiers(type_str):
         if ident not in _DEMO_KNOWN_TYPES:
-            return {"applied": False,
+            return {"applied": False, "changes": [],
                     "dropped": [{"var": "a%d" % (arg_index + 1), "type": type_str,
                                  "reason": "unknown_type:%s" % ident}]}
-    return {"applied": True, "dropped": []}
+    old = _demo_applied_struct_types.get((_norm(addr), arg_index), "void *")
+    _demo_applied_struct_types[(_norm(addr), arg_index)] = type_str
+    return {"applied": True, "dropped": [],
+            "changes": [{"op": "apply_struct", "target": "arg%d" % arg_index,
+                         "old": old, "new": type_str}]}
 
 
 # ── global naming (demo, G) ──────────────────────────────────────────────────
@@ -348,10 +360,15 @@ def name_global(global_info: dict, sites: list[dict], glossary: str = "") -> dic
 
 def set_global(addr, name: str, type_str: str = "") -> dict:
     ea = _norm(addr)
-    named = ""; typed = False; dropped: list[dict] = []
+    named = ""; typed = False; dropped: list[dict] = []; changes: list[dict] = []
+    state = _demo_global_state.get(ea, {})
+    g = next((x for x in _DEMO_GLOBALS if x["ea"] == ea), None)
+    old_name = state.get("name") or (g["name"] if g else hex(ea))
+    old_type = state.get("type") or (g.get("cur_type", "") if g else "")
     if name and name.isidentifier():
         named = name
         _demo_global_state.setdefault(ea, {})["name"] = name
+        changes.append({"op": "global_name", "old": old_name, "new": name})
     if type_str:
         reason = _demo_classify_type(type_str)
         if reason:
@@ -359,7 +376,8 @@ def set_global(addr, name: str, type_str: str = "") -> dict:
         else:
             typed = True
             _demo_global_state.setdefault(ea, {})["type"] = type_str
-    return {"named": named, "typed": typed, "dropped": dropped}
+            changes.append({"op": "global_type", "old": old_type, "new": type_str})
+    return {"named": named, "typed": typed, "dropped": dropped, "changes": changes}
 
 
 def rename_lvars(addr, names: dict, ret_type: str = "") -> dict:
@@ -368,9 +386,12 @@ def rename_lvars(addr, names: dict, ret_type: str = "") -> dict:
     renamed = 0
     retyped = 0
     dropped: list[dict] = []
+    changes: list[dict] = []
+    _old_types = {lv["name"]: lv.get("type", "") for lv in st["lvars"]}
     for old, spec in names.items():
         new = spec.get("name", "") if isinstance(spec, dict) else spec
         ty  = spec.get("type", "") if isinstance(spec, dict) else ""
+        cur = old
         if new and new != old and new.isidentifier():
             code = re.sub(rf"\b{re.escape(old)}\b", new, code)
             for lv in st["lvars"]:
@@ -379,6 +400,8 @@ def rename_lvars(addr, names: dict, ret_type: str = "") -> dict:
                     if ty:
                         lv["type"] = ty
             renamed += 1
+            changes.append({"op": "rename_var", "target": old, "old": old, "new": new})
+            cur = new
         if ty:
             # mimic the worker: unapplicable types are reported, not silently lost
             reason = _demo_classify_type(ty)
@@ -386,10 +409,13 @@ def rename_lvars(addr, names: dict, ret_type: str = "") -> dict:
                 dropped.append({"var": new or old, "type": ty, "reason": reason})
             else:
                 retyped += 1
+                changes.append({"op": "retype_var", "target": cur,
+                                "old": _old_types.get(old, ""), "new": ty})
     if ret_type:
         # reflect the return type in the demo pseudocode's leading 'void'
         code = re.sub(r"^void\b", ret_type, code, count=1)
         retyped += 1
+        changes.append({"op": "func_ret", "old": "void", "new": ret_type})
     st["pseudocode"] = code
-    return {"renamed": renamed, "retyped": retyped,
-            "ret_type": ret_type, "dropped": dropped, "pseudocode": code}
+    return {"renamed": renamed, "retyped": retyped, "ret_type": ret_type,
+            "dropped": dropped, "changes": changes, "pseudocode": code}

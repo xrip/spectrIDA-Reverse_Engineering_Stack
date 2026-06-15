@@ -173,6 +173,84 @@ def merge_field_names(fields: list[dict], named: dict) -> list[dict]:
     return out
 
 
+# scalar defaults that the model is expected to refine away — used to decide
+# which of two competing fields carries the "better" type when merging.
+_DEFAULT_SCALARS = frozenset({"_BYTE", "_WORD", "_DWORD", "_QWORD", "void *", ""})
+
+
+def real_fields(layout: list[dict]) -> list[dict]:
+    """The non-padding members of a layout."""
+    return [f for f in (layout or []) if "padding" not in (f.get("flags") or [])]
+
+
+def _is_named_field(f: dict) -> bool:
+    return (f.get("name") or "") != field_name(int(f["offset"]))
+
+
+def _is_refined_type(t: str) -> bool:
+    return bool(t) and t not in _DEFAULT_SCALARS
+
+
+def merge_layouts(a: list[dict] | None, b: list[dict] | None) -> list[dict]:
+    """Union two recovered layouts of the SAME struct into a superset.
+
+    Different functions dereference a struct at different offsets, so each
+    recovery sees only a slice. Merging accumulates them: every offset from either
+    layout is kept, the widest observed access at an offset wins, and a meaningful
+    (model-given) field name / refined type beats the size-derived default. The
+    result is re-padded and overlap-cleaned. Field count grows monotonically — the
+    struct converges to its full shape instead of the last writer clobbering it.
+    """
+    best: dict[int, dict] = {}
+    for f in list(a or []) + list(b or []):
+        flags = f.get("flags") or []
+        if "padding" in flags:
+            continue
+        off = int(f["offset"])
+        cand = dict(f)
+        cand["flags"] = [x for x in flags if x != "padding"]
+        cur = best.get(off)
+        if cur is None:
+            best[off] = cand
+            continue
+        if int(cand["size"]) > int(cur["size"]):
+            cur["size"] = int(cand["size"])
+            cur["type"] = cand.get("type", cur.get("type"))
+            cur["is_pointer"] = cand.get("is_pointer", cur.get("is_pointer"))
+            cur["flags"] = cand.get("flags", cur.get("flags"))
+        if _is_named_field(cand) and not _is_named_field(cur):
+            cur["name"] = cand["name"]
+        if _is_refined_type(cand.get("type", "")) and not _is_refined_type(cur.get("type", "")):
+            cur["type"] = cand["type"]
+            cur["is_pointer"] = cand.get("is_pointer", cur.get("is_pointer"))
+    return _finalize_layout(best)
+
+
+def _finalize_layout(by_off: dict[int, dict]) -> list[dict]:
+    """Order offset→field entries into a clean layout: drop overlaps (flagging the
+    survivor), fill gaps with padding — same discipline as ``reconcile_fields``."""
+    out: list[dict] = []
+    pos = 0
+    for off in sorted(by_off):
+        f = by_off[off]
+        size = int(f["size"])
+        if off < pos:
+            if out:
+                _add_flag(out[-1], "union_candidate")
+            continue
+        if off > pos:
+            out.append({
+                "offset": pos, "size": off - pos,
+                "name": "pad_%X" % pos, "type": "_BYTE",
+                "is_pointer": False, "flags": ["padding", "array"],
+            })
+        nf = dict(f)
+        nf["flags"] = list(f.get("flags") or [])
+        out.append(nf)
+        pos = off + size
+    return out
+
+
 def struct_decl(name: str, fields: list[dict]) -> str:
     """Render a C ``struct`` declaration from a reconciled layout, re-deriving
     padding from offsets so the layout is exact regardless of how *fields* was

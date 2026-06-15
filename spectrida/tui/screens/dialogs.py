@@ -73,6 +73,7 @@ class HelpScreen(ModalScreen[None]):
         ("F", "recover structs from field accesses, apply to pointer params"),
         ("G", "name + type generic globals (dword_*, …) from their use sites"),
         ("L", "lint — unify naming across the binary (msg/message, typos, …)"),
+        ("A", "audit — change journal + export an IDAPython revert script"),
         ("O", "overview — AI summary of the whole binary"),
         ("[ / ]", "scroll the report pane (mouse wheel works too)"),
         ("/", "fuzzy search"),

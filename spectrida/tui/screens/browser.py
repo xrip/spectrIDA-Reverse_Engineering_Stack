@@ -157,6 +157,7 @@ class BrowserScreen(Screen):
         Binding("f", "recover_structs", "Structs"),
         Binding("g", "name_globals", "Globals"),
         Binding("l", "canonicalize", "Lint"),
+        Binding("a", "audit", "Audit"),
         Binding("o", "overview", "Overview"),
         Binding("bracketright", "scroll_report_down", "Report▼", show=False),
         Binding("bracketleft", "scroll_report_up", "Report▲", show=False),
@@ -711,11 +712,17 @@ class BrowserScreen(Screen):
                 for it in info.get("items", []):
                     r = it["result"]; arg = it["arg"]
                     if r.get("ok"):
-                        tag = ("reused" if r.get("reused")
-                               else "applied" if r.get("applied") else "made")
-                        col = "green" if r.get("applied") or r.get("reused") else "yellow"
+                        if r.get("new_struct"):
+                            tag, col = "new", "green"
+                        elif r.get("grew"):
+                            tag, col = f"+{r.get('added', 0)} merged", "green"
+                        elif r.get("reused"):
+                            tag, col = "reused", "cyan"
+                        else:
+                            tag, col = "applied", "yellow"
                         drop = (f" [red]+{len(r['dropped'])} dropped[/]"
                                 if r.get("dropped") else "")
+                        # r['fields'] is now the struct's TOTAL field count
                         log.append(f"  [dim]{fn}[/] a{arg} → [b {col}]{r['struct']}[/] "
                                    f"[dim]({r['fields']}f, {tag})[/]{drop}")
                         changed = True
@@ -729,7 +736,7 @@ class BrowserScreen(Screen):
             totals = await db.recover_structs(scope="named", progress_cb=progress_cb)
             spin.update("")
             drop = f", {totals['dropped']} dropped" if totals.get("dropped") else ""
-            reuse = f", {totals['reused']} reused" if totals.get("reused") else ""
+            merged = f", {totals['merged']} merged" if totals.get("merged") else ""
             if not totals["structs"]:
                 res.update("  [dim]no recoverable structs — run naming ('B') first, "
                            "or no generic pointer params with field accesses.[/]")
@@ -739,10 +746,10 @@ class BrowserScreen(Screen):
             else:
                 res.update(f"  [b cyan]{totals['structs']}[/] structs · "
                            f"[b green]{totals['applied']}[/] applied · "
-                           f"[magenta]{totals['fields']}[/] fields{reuse}{drop}  ·  "
+                           f"[magenta]{totals['fields']}[/] fields added{merged}{drop}  ·  "
                            f"{voice.quip('naming_done')}")
             bar.set_info(f"{self._b.title} · structs — {totals['structs']} recovered, "
-                         f"{totals['applied']} applied{drop}")
+                         f"{totals['applied']} applied{merged}{drop}")
         except Exception as e:
             spin.update("")
             res.update(f"  [red]{voice.quip('error')}[/]  [dim]{e}[/]")
@@ -834,6 +841,37 @@ class BrowserScreen(Screen):
                 self.query_one(StatusBar).clear_progress()
             except Exception:
                 pass
+
+    # ── audit log (show the project change journal + export a revert script) ──
+    def action_audit(self) -> None:
+        self._spawn(self._show_audit())
+
+    async def _show_audit(self) -> None:
+        res = self.query_one("#model-result", Static)
+        rsn = self.query_one("#model-reason", Static)
+        self.query_one("#model-hint", Static).update("")
+        self.query_one("#model-spinner", Static).update("")
+        audit = self._database().audit
+        n = len(audit)
+        if not n:
+            res.update("  [dim]no changes recorded yet — name something first.[/]")
+            rsn.update("")
+            return
+        counts = audit.counts()
+        summary = " · ".join(f"{k} {v}" for k, v in sorted(counts.items()))
+        res.update(f"  [b cyan]{n}[/] changes recorded  ·  [dim]{summary}[/]")
+        body = audit.render(400)
+        # always export a fresh rollback script alongside the .i64
+        i64 = getattr(self._b, "i64", None)
+        if i64:
+            rp = str(i64) + ".spectrida-revert.py"
+            try:
+                audit.export_revert(rp)
+                body += (f"\n\n  [dim]journal:[/] {i64}.spectrida-audit.jsonl"
+                         f"\n  [dim]revert script:[/] {rp}")
+            except Exception:
+                pass
+        rsn.update(body)
 
     # ── name canonicalisation linter (unify naming across the binary) ──
     def action_canonicalize(self) -> None:

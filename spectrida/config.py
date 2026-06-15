@@ -213,6 +213,15 @@ def struct_recovery_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def audit_log_enabled() -> bool:
+    """Record every database mutation (renames, types, structs, globals) to an
+    append-only journal next to the .i64 for review / rollback (default ON).
+    Disable with SPECTRIDA_AUDIT_LOG=0.
+    """
+    raw = get("pipeline", "audit_log", "SPECTRIDA_AUDIT_LOG").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def name_lint_enabled() -> bool:
     """Canonicalise function names across the binary — unify equivalent tokens to
     the corpus's most-used form and fix typos (default ON). Disable with
